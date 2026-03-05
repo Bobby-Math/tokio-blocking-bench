@@ -1,0 +1,14 @@
+[package]
+name = "tokio-blocking-bench"
+version = "0.1.0"
+edition = "2021"
+description = "Reproduction: blocking in async Rust is invisible at low load, catastrophic at high load"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+hdrhistogram = "7"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
