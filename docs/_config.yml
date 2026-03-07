@@ -1,0 +1,14 @@
+title: Tokio Blocking Bench
+description: Executor starvation demonstration in async Rust
+theme: minima
+
+markdown: kramdown
+kramdown:
+  input: GFM
+  syntax_highlighter: rouge
+
+plugins:
+  - jekyll-seo-tag
+
+minima:
+  skin: auto
