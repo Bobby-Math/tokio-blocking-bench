@@ -94,7 +94,7 @@ The same cliff can be reached through two other paths: adding more blocking code
 
 The mechanism is identical in all cases; only the trigger differs.
 
-The benchmark repository includes [demonstrations of all three triggers](https://github.io/bobby-math/tokio-blocking-bench/ADDITIONAL_DEMOS.md).
+The benchmark repository includes [demonstrations of all three triggers](ADDITIONAL_DEMOS.md).
 
 ---
 
