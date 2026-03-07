@@ -1,22 +1,6 @@
 <style>
-/* Hide duplicate page titles that might be rendered by Minima */
-.page-content h1:first-child {
-    /* Only hide if it's the very first element and matches common patterns */
+/* CSS-only solution: Hide duplicate H1 titles */
+.page-content > .wrapper > h1:first-of-type {
+    display: none;
 }
 </style>
-
-<script>
-// Remove duplicate titles if they appear
-document.addEventListener('DOMContentLoaded', function() {
-    const h1s = document.querySelectorAll('h1');
-    if (h1s.length > 1) {
-        // Keep only the first H1, remove duplicates with same text
-        const firstText = h1s[0].textContent.trim();
-        for (let i = 1; i < h1s.length; i++) {
-            if (h1s[i].textContent.trim() === firstText) {
-                h1s[i].style.display = 'none';
-            }
-        }
-    }
-});
-</script>
