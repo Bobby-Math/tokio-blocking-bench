@@ -1,6 +1,6 @@
 # Additional Demonstrations
 
-This file accompanies the article ["The Last Free Worker: Why Blocking in Async Rust Fails Silently Until Production"](https://github.com/bobby-math/tokio-blocking-bench).
+This file accompanies the article ["Executor Starvation in Async Rust: The Hidden Cost of Blocking Code"](https://github.com/bobby-math/tokio-blocking-bench).
 
 The main article demonstrates the cliff using per-request blocking that scales with traffic. This file documents two additional triggers that reach the same cliff through different paths.
 
