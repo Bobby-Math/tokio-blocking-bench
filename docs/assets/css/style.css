@@ -23,7 +23,7 @@ body {
 .page-content {
   max-width: 960px;
   margin: 0 auto;
-  padding: 40px 20px;
+  padding: 20px 20px 40px 20px;
 }
 
 /* Typography */
@@ -160,8 +160,8 @@ th {
 .site-header {
   background: #161b22;
   border-bottom: 1px solid #30363d;
-  padding: 1rem 0;
-  margin-bottom: 2rem;
+  padding: 0.5rem 0;
+  margin-bottom: 1rem;
 }
 
 /* Code block syntax highlighting colors */
