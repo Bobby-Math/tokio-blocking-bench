@@ -1,26 +1,13 @@
 title: ""
 description: ""
 
-theme: minima
-
-minima:
-  skin: dark
+# Don't use a theme - we have custom styling
+# theme: minima
+# minima:
+#   skin: dark
 
 markdown: kramdown
 highlighter: rouge
 
 kramdown:
   input: GFM
-
-# Disable automatic page title extraction
-defaults:
-  - scope:
-      path: ""
-      type: "pages"
-    values:
-      layout: "default"
-  - scope:
-      path: ""
-      type: "posts"
-    values:
-      layout: "default"
