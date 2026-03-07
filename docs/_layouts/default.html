@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  {%- include head.html -%}
+</head>
+
+<body>
+
+  <header class="site-header">
+    <div class="wrapper">
+      {%- if site.title -%}
+        <a class="site-title" rel="author" href="{{ "/" | relative_url }}">
+          {{ site.title }}
+        </a>
+      {%- endif -%}
+    </div>
+  </header>
+
+  <main class="page-content">
+    <div class="wrapper">
+      {{ content }}
+    </div>
+  </main>
+
+</body>
+</html>
