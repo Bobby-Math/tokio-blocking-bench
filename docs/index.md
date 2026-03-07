@@ -4,8 +4,6 @@ title: ""
 
 # Executor Starvation in Async Rust: The Hidden Cost of Blocking Code
 
----
-
 ## Section 1: The Demonstration
 
 ### The execution model
