@@ -1,23 +1,13 @@
 title: "" 
 description: Executor starvation in async Rust
+
 theme: minima
+
+minima:
+  skin: dark
 
 markdown: kramdown
 highlighter: rouge
 
 kramdown:
   input: GFM
-  syntax_highlighter: rouge
-
-plugins:
-  - jekyll-seo-tag
-
-minima:
-  skin: dark
-
-defaults:
-  -
-    scope:
-      path: ""
-    values:
-      layout: default
