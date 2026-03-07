@@ -222,13 +222,12 @@ fn run_single(args: Args) {
 fn run_all_levels(args: Args) {
     let traffic_levels: Vec<usize> = vec![
         10,       // minimal: dev testing
-        50,       // light: staging
-        100,      // moderate: early production
-        200,      // growing: post-launch
-        500,      // busy: normal production
-        1000,     // heavy: peak hours
-        2000,     // spike: marketing event
-        5000,     // surge: viral moment
+        15,       // light: slightly above dev
+        20,       // moderate: basic load test
+        25,       // growing: early staging
+        30,       // busy: staging
+        40,       // heavy: moderate production
+        50,       // spike: normal production
     ];
 
     let async_work = Duration::from_millis(args.async_work_ms);
