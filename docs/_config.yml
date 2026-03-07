@@ -1,10 +1,10 @@
 title: ""
 description: ""
 
-# Don't use a theme - we have custom styling
-# theme: minima
-# minima:
-#   skin: dark
+theme: minima
+
+minima:
+  skin: dark
 
 markdown: kramdown
 highlighter: rouge
