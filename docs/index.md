@@ -95,10 +95,9 @@ The benchmark repository includes [demonstrations of all three triggers](ADDITIO
 
 ## Section 2: What a Tokio Worker Thread Actually Does
 
-Each worker thread runs a poll loop: pull a task from a queue, call poll() on it, and check the I/O driver for readiness events. The poll()
-method returns Poll::Ready when the task is complete, or Poll::Pending when the task cannot make progress yet. When a task returns Pending, it registers a Waker with the I/O source it is waiting on. When that source becomes ready, it calls waker.wake(), placing the task back on a run queue. This is cooperative scheduling: tasks yield voluntarily, and the runtime resumes them only when they declare they can make progress.
+Each worker thread runs a `poll` loop: pull a task from a queue, call `poll()` on it, and check the I/O driver for readiness events. The `poll()` method returns `Poll::Ready` when the task is complete, or `Poll::Pending` when the task cannot make progress yet. When a task returns Pending, it registers a Waker with the I/O source it is waiting on. When that source becomes ready, it calls `waker.wake()`, placing the task back on a run queue. This is cooperative scheduling: tasks yield voluntarily, and the runtime resumes them only when they declare they can make progress.
 
-The Rust compiler transforms every async fn into a state machine, with each .await point becoming a state transition. A worker is occupied only during the brief moments between .await points—typically microseconds. The I/O operation might take 5 milliseconds, but the worker is held for microseconds. Each worker maintains a local task queue, and when a worker's queue is empty, it steals tasks from other workers' queues. 
+The Rust compiler transforms every async fn into a state machine, with each .await point becoming a state transition. A worker is occupied only during the brief moments between .await points, typically microseconds. The I/O operation might take 5 milliseconds, but the worker is held for microseconds. Each worker maintains a local task queue, and when a worker's queue is empty, it steals tasks from other workers' queues. 
 
 This is the mechanism that allows one free worker to absorb the load of blocked workers. The worker thread has no timeout, no preemption mechanism, and no way to distinguish a 2-microsecond poll from a 200-millisecond poll. From the worker's perspective, both are function calls that have not yet returned.
 
@@ -139,6 +138,11 @@ A file read might return in 50 microseconds if the page is cached, or 5 millisec
 
 The compiler cannot distinguish this from legitimate CPU work that happens to take a long time. Static analysis cannot determine, in the general case, whether a function call will block. Blocking is a runtime property that depends on the kernel, the device, the network, and the current system load.
 
+This is not a limitation of Rust's compiler design. It is a fundamental limitation of static analysis. Rice's theorem proves that all non-trivial semantic properties of programs are undecidable. Whether a function call will block the thread is a semantic property of the function's behavior, not its syntax. 
+
+No static analysis tool can, in the general case, distinguish a blocking call from a long-running computation. The Church-Turing thesis tells us that this is not a technical debt item to be fixed; it is a mathematical certainty.
+
+
 ### How blocking code enters async codebases
 
 Given that the compiler cannot help, blocking code enters production through several well-worn paths:
@@ -153,7 +157,7 @@ Across all paths, the blocking code is correct. It produces the right output. Th
 
 ### The saturation threshold 
 
-Why spare capacity hides the damage and increased load exposes the damage? The point where blocking transitions from invisible to catastrophic.
+The point where blocking transitions from invisible to catastrophic.
 
 At low concurrency, blocking calls rarely overlap. If one worker is blocked, the other three continue their poll loop, stealing tasks from the blocked worker's queue. The stolen tasks experience some additional latency, but the system stays within timeout thresholds. The service appears healthy.
 
@@ -197,67 +201,19 @@ On 4 workers, the cliff appears at roughly 20 concurrent requests with 30% block
 
 ## Section 5: From Scheduling Delay to Panic
 
-Sections 3 and 4 established that blocking code inflates scheduling overhead from microseconds to hundreds of milliseconds. That overhead, by itself, does not cause a panic. A task that takes 150 milliseconds instead of 10 milliseconds is slow, but slow is not broken. The panic comes from a secondary mechanism that converts latency into an error. There are four common mechanisms in production async services, and all four are triggered by the same scheduling delay.
+Sections 3 and 4 established that blocking code inflates scheduling overhead from microseconds to hundreds of milliseconds. That overhead, by itself, does not cause a panic. A task that takes 150 milliseconds instead of 10 milliseconds is slow, but slow is not broken. The panic comes from a secondary mechanism that converts latency into an error. 
 
-### The timeout path
+There are four common mechanisms in production async services, and all four are triggered by the same scheduling delay.
 
-The most direct path from scheduling delay to panic runs through timeouts. Async libraries and frameworks routinely wrap operations in `tokio::time::timeout`:
+**Timeouts:** Operations wrapped in `tokio::time::timeout` fail when scheduling delay consumes the entire margin. A 100ms timeout with 10ms
+query time leaves 90ms for scheduling jitter. Under starvation, the task waits 140ms in the ready queue before being polled. The query still
+takes 10ms, but the total is 150ms and the timeout fires.
 
-```rust
-let result = tokio::time::timeout(
-    Duration::from_millis(100),
-    db.query("SELECT * FROM users WHERE id = $1", &[&id])
-).await;
-```
+**Channel backpressure:** Bounded channels (`tokio::sync::mpsc`) fill when the consumer task is stalled. The producer's `send()` calls block or timeout with errors like "channel full." The error points at the producer-consumer boundary, not at the blocking code that stalled the consumer.
 
-Under normal conditions, the database query completes in 10 milliseconds. The 100-millisecond timeout provides a 90-millisecond margin for scheduling jitter, network variance, and database load. Under worker starvation, the task sits in the ready queue for 140 milliseconds before a worker polls it. The query itself still takes 10 milliseconds, but the total elapsed time is 150 milliseconds. The timeout fires, `timeout` returns `Err(Elapsed)`, and if the calling code handles this with `.unwrap()`, `.expect()`, or propagates it to a handler that panics on error, the service panics. This is exactly what the demonstration in Section 1 showed: 290 operations exceeded a 100-millisecond timeout because their scheduling delay alone consumed the entire margin.
+**Connection pool exhaustion:** Database pools are exhausted when stalled tasks hold connections while waiting to be polled. The pool reports "acquire timeout" even though the database is healthy and underloaded. Connections are occupied by tasks that cannot execute, not by active queries.
 
-### The channel backpressure path
-
-Bounded channels introduce a second failure path. A common async architecture uses `tokio::sync::mpsc` channels to decouple producers from consumers:
-
-```rust
-let (tx, mut rx) = tokio::sync::mpsc::channel(100); // bounded, capacity 100
-
-// Producer task
-tokio::spawn(async move {
-    for item in items {
-        tx.send(process(item)).await.unwrap();
-    }
-});
-
-// Consumer task
-tokio::spawn(async move {
-    while let Some(item) = rx.recv().await {
-        handle(item).await;
-    }
-});
-```
-
-The consumer task calls `rx.recv().await`, which returns `Poll::Pending` when the channel is empty and waits for a Waker from the sender. Under worker starvation, the consumer task is woken (a message is available) but sits in the ready queue waiting for a worker to poll it. Meanwhile, the producer keeps sending messages. The bounded channel fills to its capacity of 100. The producer's `tx.send().await` now returns `Poll::Pending` because the channel is full, and the producer is also parked.
-
-If the producer uses `tx.try_send()` instead, it gets `Err(TrySendError::Full)` and must decide whether to drop the message, buffer it, or propagate the error. If the producer uses `tx.send_timeout()`, the timeout fires and returns an error. In any of these cases, a component that was working correctly is now failing because a worker thread somewhere else in the runtime is blocked. The error message says "channel full" or "send timeout," not "worker thread blocked by std::fs::read."
-
-### The connection pool exhaustion path
-
-Database connection pools introduce a third failure path. Pools like sqlx, deadpool, and bb8 maintain a fixed number of connections:
-
-```rust
-let pool = PgPool::connect_with(
-    PgConnectOptions::new().host("db.internal")
-).await?;
-// Pool has a default max of, say, 10 connections.
-```
-
-An async task acquires a connection, sends a query, and awaits the response. Under normal conditions, the task holds the connection for the duration of the query (10-50 milliseconds), then releases it. Under worker starvation, the task holds the connection while sitting in the ready queue. The query response has arrived (the kernel has buffered it on the socket), but no worker is available to poll the task and process the response. The connection is occupied but idle: it is not doing work, and it is not released back to the pool.
-
-Other tasks that need a database connection call `pool.acquire().await`. If all connections are held by stalled tasks, `acquire` returns `Poll::Pending` and the requesting task waits. If the pool has an acquisition timeout (and it should), the timeout fires. The service now reports "connection pool exhausted" or "acquire timeout" errors. The database is healthy, reachable, and underloaded. The pool is exhausted because connections are held by tasks that cannot be polled, not because the database is slow. The error points at the database layer, not at the blocking code that starved the workers.
-
-### The mutex contention path
-
-Shared state protected by `tokio::sync::Mutex` introduces a fourth failure path. Under normal scheduling, a task acquires the mutex, performs a short critical section, and releases it within microseconds. Under worker starvation, a task acquires the mutex, then returns `Poll::Pending` at an `.await` inside the critical section. The task holds the mutex while parked in the ready queue. Every other task that attempts to acquire the same mutex is now blocked behind a task that is not being polled.
-
-If the mutex guard is held across an `.await` point (which `tokio::sync::Mutex` is specifically designed to allow), scheduling delay directly translates into lock hold time. The result is cascading contention: tasks wait for a lock held by a task that is waiting for a worker. The error surfaces as increased latency across every task that touches the shared state, or as a deadlock if the contention is severe enough.
+**Mutex contention:** A task holding `tokio::sync::Mutex` across an `.await` point holds the lock while parked in the ready queue. Other tasks contend for a lock held by a task that cannot run. This manifests as cascading latency or deadlock.
 
 ### Why blame lands on the wrong code
 
@@ -267,17 +223,17 @@ The timeline the team observes is: workload increased (or a new library was inte
 
 ### The diagnostic gap
 
-This failure mode is invisible to stack traces. The blocking code is not in the panicking task's call stack. The panic originates in a timeout, a channel operation, or a pool acquisition, none of which reference the function that blocked the worker.
+This failure mode evades standard diagnostics:
 
-It is invisible to CPU profilers. The blocking code is waiting on network I/O or disk I/O. It consumes negligible CPU time. A flame graph shows the blocking function as a thin sliver of wall-clock time with almost no on-CPU samples. The profiler does not flag it because it is not burning CPU.
+- Stack traces: The blocking code is not in the panicking task's call stack. The panic originates in timeouts, channel operations, or pool
+acquisitions—none of which reference the function that blocked the worker.
+- CPU profilers: Blocking code waits on I/O, consuming negligible CPU. Flame graphs show it as a thin sliver with no on-CPU samples.
+- Application logs: The blocking code logs "config downloaded" or "file read complete." The async code logs "timeout exceeded" or "connection pool exhausted." No log entry connects them.
+- p50-based monitoring: p50 increases by less than 9% even at full blockage. A median-latency dashboard shows a healthy service while 1% of requests experience 140ms of scheduling delay.
+- Code review: The blocking code is correct and well-tested. It would pass any review. The defect is contextual: safe in synchronous code,
+hazardous in async code.
 
-It is invisible to application logs. The blocking code completes successfully and logs "config downloaded" or "file read complete." The async code that fails logs "timeout exceeded" or "connection pool exhausted." There is no log entry that connects the two.
-
-It is invisible to p50-based monitoring. Section 4 showed that p50 increases by less than 9% even at full blockage. A dashboard displaying median latency shows a healthy service while 1% of requests experience 140 milliseconds of scheduling delay.
-
-It is invisible to code review. The blocking code is a correct, well-tested function that produces the right output. It would pass any review focused on correctness, error handling, or code style. The defect is contextual: the function is safe in synchronous code and hazardous in async code, and nothing in the function itself reveals which context it runs in.
-
-It is visible to `tokio-console`, which shows per-task poll latency and worker thread utilization. It is visible to targeted benchmarks that measure scheduling overhead under controlled conditions. It is visible to engineers who understand the cooperative scheduling contract and know to look for violations of it. The next section covers how to use these tools and how to prevent the problem from occurring.
+The failure is visible only to tokio-console (per-task poll latency), runtime metrics (worker_poll_count divergence), and engineers who understand the cooperative scheduling contract.
 
 ---
 
@@ -309,35 +265,7 @@ let config = std::fs::read("/etc/app/config.toml")?;
 let config = tokio::fs::read("/etc/app/config.toml").await?;
 ```
 
-For HTTP clients:
-
-```rust
-// BEFORE: blocks the worker for the full HTTP round-trip.
-let bytes = reqwest::blocking::get(url)?.bytes()?;
-
-// AFTER: yields at each .await during the round-trip.
-let bytes = reqwest::get(url).await?.bytes().await?;
-```
-
-For sleep:
-
-```rust
-// BEFORE: puts the OS thread to sleep.
-std::thread::sleep(Duration::from_millis(100));
-
-// AFTER: parks the task, frees the worker, wakes via the timer wheel.
-tokio::time::sleep(Duration::from_millis(100)).await;
-```
-
-For DNS resolution:
-
-```rust
-// BEFORE: std::net::ToSocketAddrs blocks during DNS lookup.
-let addr = "db.internal:5432".to_socket_addrs()?.next().unwrap();
-
-// AFTER: Tokio's async DNS resolution.
-let addr = tokio::net::lookup_host("db.internal:5432").await?.next().unwrap();
-```
+The same pattern applies to HTTP (reqwest::blocking::get → reqwest::get), sleep (std::thread::sleep → tokio::time::sleep), DNS (std::net::ToSocketAddrs → tokio::net::lookup_host), and any other I/O operation.
 
 In every case, the network latency or disk latency is identical. The CPU work is identical. What changes is that the worker thread is no longer held hostage during the wait. The state machine yields at the `.await` point, the worker polls other tasks, and the task resumes when the I/O completes.
 
