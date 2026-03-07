@@ -101,3 +101,9 @@ In all three cases:
 - The blocking code appears in no failure trace.
 - The failures manifest as timeouts in unrelated async code.
 - A developer looking at the error traces would blame the async handlers, not the blocking code.
+
+---
+
+## Notes 
+
+1. **A note on the barrier.** All tasks start simultaneously via a `tokio::sync::Barrier`. This creates a worst-case scenario where blocking calls overlap maximally at the start of each run. Real traffic patterns have staggered arrivals, which could shift the threshold in either direction depending on arrival rate and blocking duration. The barrier is a simplifying assumption for reproducibility. We are studying worker behavior at increased load; in the real world, that load could come from more blocking code, more non-blocking code, or traffic spikes. The mechanism is the same.

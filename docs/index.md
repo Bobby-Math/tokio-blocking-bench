@@ -8,21 +8,14 @@ title: ""
 
 ### The execution model
 
-Tokio's multi-threaded runtime operates on three levels of execution that are often conflated but must be understood separately.
+Three levels of execution: hardware threads, worker threads, and tasks. Each level multiplexes onto the one below it.
 
-At the bottom are hardware threads: the logical CPUs exposed by the processor. With SMT (Hyperthreading), each physical core exposes 2 hardware threads. AWS reports each hardware thread as a vCPU, so a 4-vCPU instance has 2 physical cores and 4 logical CPUs available for scheduling.
+Hardware threads are the logical CPUs your processor exposes: one per vCPU on AWS, or two per physical core with SMT. Tokio creates one worker thread (a real OS thread via std::thread::spawn) per logical CPU. These worker threads run Tokio's poll loop for the lifetime of the runtime.
 
-By default, Tokio creates one OS thread per logical CPU at startup. These are Tokio's worker threads.
+Your code spawns tasks via tokio::spawn. These are the state machines the compiler generates from your async fn, with each .await point compiled into a state transition that yields control back to the worker.
 
-Each worker thread runs a loop that pulls async tasks from a queue, calls poll() on them, and checks the I/O driver for readiness events.
-
-At the top are tasks: the compiler-generated state machines produced by `async fn` and spawned via `tokio::spawn`.
-
-A task has no thread of its own; it borrows a worker thread for the duration of each `poll()` call, typically microseconds, then yields.
-
-On a 4-vCPU machine, this means 4 worker threads and potentially thousands of tasks multiplexed across them.
-
-The ratio of tasks to worker threads is the source of async Rust's efficiency, and the source of its most insidious failure mode.
+A task has no thread on it's own. It borrows a worker thread for microseconds during each poll() call, then yields. Between yield points, the worker is free to poll other tasks, check the I/O driver for readiness events via mio, or steal work from other workers' queues.
+On a 4-vCPU machine, 4 worker threads cycle through thousands of tasks. The ratio of tasks to workers gives async Rust its efficiency, and its most insidious failure mode.
 
 ### The scenario
 
@@ -102,86 +95,12 @@ The benchmark repository includes [demonstrations of all three triggers](ADDITIO
 
 ## Section 2: What a Tokio Worker Thread Actually Does
 
-To understand why the failures in Section 1 occurred, you need a precise picture of what a worker thread does with its time.
+Each worker thread runs a poll loop: pull a task from a queue, call poll() on it, and check the I/O driver for readiness events. The poll()
+method returns Poll::Ready when the task is complete, or Poll::Pending when the task cannot make progress yet. When a task returns Pending, it registers a Waker with the I/O source it is waiting on. When that source becomes ready, it calls waker.wake(), placing the task back on a run queue. This is cooperative scheduling: tasks yield voluntarily, and the runtime resumes them only when they declare they can make progress.
 
-### The poll loop
+The Rust compiler transforms every async fn into a state machine, with each .await point becoming a state transition. A worker is occupied only during the brief moments between .await points—typically microseconds. The I/O operation might take 5 milliseconds, but the worker is held for microseconds. Each worker maintains a local task queue, and when a worker's queue is empty, it steals tasks from other workers' queues. 
 
-Each worker thread runs a loop that repeats three operations: pull a task from the local run queue, call `poll()` on it, and check the I/O driver for readiness events.
-
-This loop runs for the entire lifetime of the runtime. The worker never sleeps voluntarily unless its queue is empty and no I/O events are pending.
-
-When a task is available, the worker calls the task's `poll` method. `poll` is the single method defined by Rust's `Future` trait:
-
-```rust
-pub trait Future {
-    type Output;
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output>;
-}
-```
-
-The return type, `Poll`, has exactly two variants: `Poll::Ready(value)` when the task has produced its final result, and `Poll::Pending` when the task cannot make progress yet.
-
-If `poll` returns `Ready`, the task is complete and the worker moves on to the next task in the queue. If `poll` returns `Pending`, the task is parked: it leaves the run queue and will not be polled again until something wakes it.
-
-A single iteration of this loop (pull, poll, check I/O) typically takes microseconds. This is how four worker threads can service thousands of tasks: each task occupies a worker for a few microseconds per poll, then yields.
-
-### The Waker contract
-
-When a task returns `Poll::Pending`, it makes a contract with the runtime.
-
-The contract is: "I have registered a `Waker` with the I/O source I am waiting on. When that source is ready, it will call `waker.wake()`, which will place me back on a worker's run queue."
-
-The `Waker` is provided to the task through the `Context` argument in the `poll` signature. The I/O source might be a TCP socket becoming readable, a timer expiring, or a channel receiving a message.
-
-When the source is ready, it calls `wake()` on the stored `Waker`. The runtime receives the wake signal and pushes the task back onto a worker's local queue. The worker picks up the task on a future iteration of its loop, calls `poll` again, and the task resumes from where it left off.
-
-This is cooperative scheduling: the task voluntarily yields by returning `Pending`, and the runtime resumes it only when the task has declared it can make progress.
-
-The entire model depends on two properties: tasks must return `Pending` quickly, and tasks must register a `Waker` before returning `Pending`. If either property is violated, the model breaks.
-
-### How async fn produces cooperative tasks
-
-The cooperative model works because the Rust compiler transforms every `async fn` into a type that implements `Future`. The generated type is a state machine. Each `.await` point in the function body becomes a state transition in the machine.
-
-Consider a simplified async function:
-
-```rust
-async fn handle_request(db: &Pool, id: u64) -> Result<Response, Error> {
-    let row = db.query("SELECT * FROM users WHERE id = $1", &[&id]).await?;
-    let profile = fetch_profile(row.profile_url).await?;
-    Ok(build_response(row, profile))
-}
-```
-
-This function has two `.await` points: the database query and the profile fetch. The compiler generates a state machine with roughly three states: waiting for the database query, waiting for the profile fetch, and completed.
-
-When `poll` is called for the first time, the state machine initiates the database query and returns `Poll::Pending`, because the query has not completed yet. At this point, the worker thread is free. The database query's I/O source (the TCP socket to the database) holds the task's `Waker`. The worker immediately moves on to poll the next task in its queue.
-
-When the database response arrives, the kernel signals the socket as readable, Tokio's I/O driver detects the readiness event, and the driver calls `wake()` on the stored `Waker`. The task re-enters the run queue.
-
-A worker (possibly a different one) picks it up, calls `poll` again, and the state machine advances to the next state: it processes the database row, initiates the profile fetch, and returns `Poll::Pending` again. The cycle repeats until the state machine reaches its final state and returns `Poll::Ready(response)`.
-
-The critical property of this entire sequence is that the worker thread was occupied only during the brief moments between `.await` points. The database query took 5 milliseconds, but the worker was held for microseconds. The profile fetch took 20 milliseconds, but the worker was held for microseconds. The rest of that time, the worker was polling other tasks.
-
-### Work-stealing
-
-Each worker thread maintains its own local task queue. When a task's `Waker` fires, the runtime typically pushes the task onto the queue of the worker that is running the I/O driver at that moment. This means tasks can end up unevenly distributed: one worker might have 200 tasks queued while another has 10.
-
-To balance this, Tokio implements work-stealing. When a worker's local queue is empty, it checks other workers' queues and steals a batch of tasks. The steal operation takes tasks from the tail of another worker's queue (LIFO order for the stealer, FIFO for the victim), which tends to preserve cache locality for the victim's most recently queued tasks.
-
-Work-stealing runs automatically and requires no configuration. Its relevance to the failure in Section 1 is this: when one worker thread becomes unavailable, the other workers steal its tasks and continue processing them. This is the mechanism that makes blocking invisible at low load.
-
-As long as at least one worker is running its poll loop, it will steal and process tasks from blocked workers' queues. The tasks experience some additional latency from the steal operation and from competing with more tasks on fewer workers, but the system continues to function.
-
-### The cooperative contract, summarized
-
-A healthy Tokio runtime depends on every task obeying a simple contract: do a small amount of work, yield by returning `Poll::Pending`, and arrange to be woken when you can make progress.
-
-Worker threads enforce no part of this contract. A worker calls `poll` and waits for the return value. It has no timeout on the poll call. It has no mechanism to preempt a task that is taking too long. It has no way to distinguish a task that is doing legitimate computation from a task that has blocked the OS thread.
-
-From the worker's perspective, a `poll` that takes 2 microseconds and a `poll` that takes 200 milliseconds look identical: both are function calls that have not yet returned. The worker simply waits. Every other task in that worker's queue waits with it.
-
-This is the mechanical foundation for everything that follows in Section 3.
+This is the mechanism that allows one free worker to absorb the load of blocked workers. The worker thread has no timeout, no preemption mechanism, and no way to distinguish a 2-microsecond poll from a 200-millisecond poll. From the worker's perspective, both are function calls that have not yet returned.
 
 ---
 
@@ -191,15 +110,9 @@ Now consider what happens when a task calls `std::thread::sleep`, `reqwest::bloc
 
 ### The mechanism
 
-The blocking call does not return `Poll::Pending`. It does not register a `Waker`. It does not transition the state machine to a parked variant. It simply occupies the OS thread until the operation completes.
+The blocking call does not return `Poll::Pending`. It does not register a `Waker`. It simply occupies the OS thread until the operation completes. 
 
-From the worker thread's perspective, it called `poll` on a task, and the `poll` method has not returned. The worker's loop is frozen. It cannot pull the next task from its queue. It cannot check the I/O driver for readiness events. It cannot participate in work-stealing.
-
-Every task in that worker's queue, and every pending Waker that would have been serviced by that worker's I/O driver check, is stalled until the blocking call returns.
-
-Compare this to the async example from Section 2. The database query in `handle_request` held the worker for microseconds, then returned `Pending`, freeing the worker to poll other tasks during the 5-millisecond network round-trip. A blocking version of the same query would hold the worker for the entire 5 milliseconds. During those 5 milliseconds, every other task on that worker is frozen.
-
-The difference is not in the result (both return the same database row) or the total wall-clock time (both take 5 milliseconds). The difference is in how long the worker thread is held hostage. Microseconds versus milliseconds. One allows the worker to service hundreds of other tasks during the wait. The other allows it to service none.
+The worker's loop is frozen. It cannot pull the next task, cannot check the I/O driver, cannot participate in work-stealing. Every task in that worker's queue is stalled until the blocking call returns.
 
 ### Why the compiler cannot catch this
 
@@ -228,93 +141,31 @@ The compiler cannot distinguish this from legitimate CPU work that happens to ta
 
 ### How blocking code enters async codebases
 
-Given that the compiler cannot help, blocking code enters production async services through several well-worn paths.
+Given that the compiler cannot help, blocking code enters production through several well-worn paths:
 
-#### Pre-async code that survives a migration
+- Pre-async code: Utility functions that load config, parse static data, or read feature flags remain synchronous after a migration to async. They work correctly and are never rewritten.
+- The standard library: std::fs, std::net, and std::thread are synchronous. A developer who reaches for these out of habit writes code that compiles without warning. Tokio provides async equivalents, but the compiler does not suggest them.
+- Non-obvious blocking: println! to a slow stdout, serde_json::from_slice on large payloads, env::var under contention. These do not look like blocking I/O in code review.
+- FFI calls: Any call into a C library is blocking by default. Crypto libraries, compression, DNS resolution via libc—they all block the calling thread.
+- Transitive dependencies: A crate three layers deep calls std::fs::metadata or reqwest::blocking::get. You never see it in your source code. It compiles, passes CI, and blocks in production.
 
-The most common path is code that predates the async migration. A codebase starts as synchronous Rust. The team migrates the network layer to Tokio for better concurrency. The HTTP server becomes async, the request handlers become async, the database queries become async. But the utility functions that load configuration files, parse static data at startup, initialize logging, or read feature flags from disk remain synchronous. They work correctly. They are not on the apparent critical path. They were written before Tokio entered the picture, and nobody rewrites a working config loader just because the HTTP server is now async. These functions sit in the codebase for months or years, called from async handlers, blocking a worker thread on every invocation, invisible until the concurrency reaches the threshold.
+Across all paths, the blocking code is correct. It produces the right output. The defect is not in what the code does, but in where it runs.
 
-#### The standard library itself
+### The saturation threshold 
 
-Rust's standard library provides synchronous-only APIs for common operations. `std::fs::read`, `std::fs::write`, `std::fs::metadata`, `std::net::TcpStream::connect`, and `std::thread::sleep` are all synchronous. Tokio provides async equivalents for each of these: `tokio::fs::read`, `tokio::net::TcpStream`, `tokio::time::sleep`. But the standard library is what every Rust developer learns first. A developer who reaches for `std::fs::read` out of habit, or who does not know that `tokio::fs` exists, writes code that compiles without warning, passes every test, and blocks a worker thread on every call. The compiler does not suggest the async alternative. Nothing in the error output distinguishes `std::fs::read` from `tokio::fs::read` except the presence of an `.await`.
+Why spare capacity hides the damage and increased load exposes the damage? The point where blocking transitions from invisible to catastrophic.
 
-#### Implicit blocking that does not look like I/O
+At low concurrency, blocking calls rarely overlap. If one worker is blocked, the other three continue their poll loop, stealing tasks from the blocked worker's queue. The stolen tasks experience some additional latency, but the system stays within timeout thresholds. The service appears healthy.
 
-Some blocking calls do not look like I/O operations at all. `println!` writes to stdout, which is typically line-buffered. If stdout is piped to a slow consumer, a logging daemon with a full buffer, or a container runtime that applies backpressure, the write blocks. `serde_json::from_slice` on a multi-megabyte payload is CPU-bound: it holds the worker thread for the duration of the parse, which can be tens of milliseconds on a large document. `env::var` on some platforms acquires a lock that can block under contention. None of these look like "blocking I/O" in a code review. They are function calls that a reviewer would scan past without a second thought, because they appear to be pure computation or simple output.
+The self-healing breaks when blocking calls overlap enough to saturate the worker pool. When the number of blocked workers equals the total worker count, there are zero free workers running the poll loop. No tasks are polled. No I/O events are checked. No work-stealing happens.
 
-#### FFI calls into C libraries
-
-Any call across the FFI boundary into a C library is blocking by default. The C function does not know it is running inside a Tokio worker thread. It does not return `Poll::Pending`. It does not register a Waker. It runs to completion on the calling thread, however long that takes. Crypto libraries (OpenSSL, ring's C components), compression libraries (zlib, zstd), image processing libraries, and system-level DNS resolution (getaddrinfo via libc) all block the calling thread. Rust's ownership and borrowing guarantees stop at the FFI boundary. The cooperative scheduling contract stops there too.
-
-#### Transitive dependencies
-
-The most difficult path to defend against is blocking code inside dependencies you do not control. Your own code may be clean. Your direct dependencies may be clean. But a crate three layers deep in your dependency tree calls `std::fs::metadata` to check whether a cache file exists, or `reqwest::blocking::get` to fetch a license validation response, or `std::thread::sleep` in a retry loop. You never see the blocking call in your own source code. It does not appear in any file you wrote or reviewed. It compiles, it passes CI, and it blocks a worker thread in production. Auditing transitive dependencies for blocking calls requires inspecting the source of every crate in your dependency tree, which is rarely practical.
-
-#### The common thread
-
-Across all five paths, the blocking code is correct. It produces the right output. It handles errors properly. It would pass any code review focused on correctness, style, or error handling. The defect is not in what the code does, but in where it runs. The same function that is perfectly safe in a synchronous context becomes a scheduling hazard in an async context. And the compiler cannot tell the difference.
-
-### Why spare capacity hides the damage
-
-Return to the scenario from Section 1: four worker threads, 30% of requests hitting a blocking path that takes 50 milliseconds.
-
-At 10 concurrent requests, roughly 3 requests hit the blocking path. Even if all 3 blocking calls overlap (unlikely at low concurrency), one worker remains free. That free worker continues its poll loop: pulling tasks, checking I/O, stealing work from the queues of blocked workers.
-
-It is a direct consequence of work-stealing. The stolen tasks experience some additional latency from competing with more tasks on fewer workers, but the latency stays well within timeout thresholds. From the outside, the service is healthy. Metrics show normal latency. The blocking code completes successfully and returns correct results. Nothing appears wrong.
-
-Section 2 described how workers steal tasks from other workers' queues when their own queues are empty. When a worker is blocked, its queue grows because tasks are being woken by the I/O driver but the worker cannot poll them. Free workers detect the growing queue and steal from it. As long as the free workers can drain the stolen tasks faster than they accumulate, latency stays bounded. The system is self-healing, up to a point.
-
-### Why increased load exposes the damage
-
-The self-healing breaks when the load exceeds what the remaining free workers can absorb. This can happen through any of the three triggers shown in Section 1.
-
-More blocking calls overlap (because traffic increased), reducing the number of free workers. More async tasks queue up (because a new library was integrated), increasing the work each free worker must handle. Or both happen simultaneously.
-
-The critical transition is when the number of simultaneously blocked workers approaches or equals the total worker count. At that point, there are zero free workers running the poll loop. No tasks are being polled. No I/O events are being checked. No work-stealing is happening, because there is no worker available to steal.
-
-Tasks only execute in the brief gaps when a blocking call completes and its worker resumes the poll loop for a few microseconds before the next blocking call lands on it. Scheduling delay goes from microseconds to tens or hundreds of milliseconds.
-
-This transition is a cliff, rather than gradual. Section 1 showed this empirically: zero failures at 15 concurrent requests, 5.5% at 20, 37% at 30, 94% at 50.
-
-The system does not degrade linearly. It functions normally until a threshold, then collapses. The threshold is determined by the ratio of simultaneously blocked workers to total workers. Below 1.0, the system self-heals through work-stealing. At 1.0, the self-healing mechanism is gone and every async task in the runtime is starved.
+This is a cliff, not gradual degradation. Section 1 showed this empirically: zero failures at 15 concurrent requests, 94% at 50. The threshold is determined by the ratio of blocked workers to total workers. Below 1.0, the system self-heals. At 1.0, every async task is starved.
 
 ---
 
 ## Section 4: The Benchmark
 
 The demonstration in Section 1 showed the cliff through operational failures: timeouts and cascading errors. To understand the cliff with more precision, we need to measure the scheduling overhead directly.
-
-### Methodology
-
-The benchmark measures async task scheduling latency under controlled blocking conditions. Each scenario spawns a fixed number of async tasks and blocking tasks, then measures how long async operations take to complete.
-
-The core measurement loop is simple:
-
-```rust
-for _ in 0..iterations {
-    let t0 = Instant::now();
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    let overhead = t0.elapsed().saturating_sub(Duration::from_millis(10));
-    histogram.record(overhead.as_micros() as u64);
-}
-```
-
-Each async task performs 10 sequential sleeps of 10 milliseconds each. For each sleep, the benchmark records the overhead: actual elapsed time minus the expected 10 milliseconds. In a healthy runtime, overhead per sleep is roughly 1 millisecond. Under worker starvation, the overhead per sleep grows to tens or hundreds of milliseconds as the task waits in the ready queue between each `.await` point.
-
-Blocking tasks simulate the synchronous code path:
-
-```rust
-for _ in 0..5 {
-    std::thread::sleep(Duration::from_millis(50));
-    tokio::task::yield_now().await;
-}
-```
-
-Each blocking task holds a worker thread for 50 milliseconds, yields briefly, then repeats. This models the pattern from Section 1: a blocking call that completes successfully and returns control to the runtime.
-
-**A note on the barrier.** All tasks start simultaneously via a `tokio::sync::Barrier`. This creates a worst-case scenario where blocking calls overlap maximally at the start of each run. Real traffic patterns have staggered arrivals, which could shift the threshold in either direction depending on arrival rate and blocking duration. The barrier is a simplifying assumption for reproducibility. We are studying worker behavior at increased load; in the real world, that load could come from more blocking code, more non-blocking code, or traffic spikes. The mechanism is the same.
-
-Full benchmark code is available at [github.com/bobby-math/tokio-blocking-bench](https://github.com/bobby-math/tokio-blocking-bench).
 
 ### Results
 
@@ -332,22 +183,11 @@ high-async/4-blockers          4    500      4      1300    140415     150271
 
 ### Three observations
 
-**First: the cliff is real and sharp.** With 3 blocking tasks on 4 workers, p99 latency is 1.5 milliseconds. With 4 blocking tasks on 4 workers, p99 latency is 140 milliseconds. That is a 90x increase from adding one blocking task. The system does not degrade linearly. It functions normally until the blocking count equals the worker count, then collapses.
+The cliff is real and sharp. With 3 blockers on 4 workers, p99 is 1.5ms. With 4 blockers, p99 is 140ms—a 90x increase from one task. The system does not degrade linearly; it collapses when blocked workers equal total workers.
 
-**Second: p50 is blind to the problem.** Look at the p50 column. At 3 blockers, p50 is 1,310 microseconds. At 4 blockers, p50 is 1,300 microseconds. The median latency is virtually unchanged. A monitoring system that alerts on p50 would see nothing wrong. The damage is entirely in the tail: p99 and max. This is why blocking-induced starvation evades median-based monitoring and only surfaces in tail latency metrics or timeout rates.
+p50 is blind to the problem. At 3 blockers, p50 is 1,310μs. At 4 blockers, p50 is 1,300μs. The median is virtually unchanged. The damage is entirely in the tail.
 
-**Third: one worker is the margin.** The difference between 3 blockers and 4 blockers is the difference between "one free worker" and "zero free workers." With one free worker, the system self-heals through work-stealing and maintains sub-2ms p99. With zero free workers, work-stealing cannot function and p99 explodes by two orders of magnitude. The last free worker is not a luxury. It is the entire margin between a functioning service and a failing one.
-
-### Cross-run consistency
-
-All three runs showed the same pattern:
-
-| Scenario | Run 1 p99 | Run 2 p99 | Run 3 p99 |
-|----------|-----------|-----------|-----------|
-| high-async/3-blockers | 1,564 μs | 1,418 μs | 1,372 μs |
-| high-async/4-blockers | 140,415 μs | 140,415 μs | 140,415 μs |
-
-The cliff is not a fluke of a single run. It is a stable, reproducible property of the system. The threshold is deterministic: when blocked workers equal total workers, the runtime starves.
+One worker is the margin. The difference between 3 and 4 blockers is the difference between one free worker and zero. With one free worker, the system self-heals. With zero, p99 explodes by two orders of magnitude.
 
 ### Scaling to production hardware
 
