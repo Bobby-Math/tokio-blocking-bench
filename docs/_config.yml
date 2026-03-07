@@ -11,3 +11,11 @@ highlighter: rouge
 
 kramdown:
   input: GFM
+
+# Disable automatic page title extraction
+defaults:
+  - scope:
+      path: ""
+      type: "pages"
+    values:
+      layout: "default"
