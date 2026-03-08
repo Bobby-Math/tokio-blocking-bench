@@ -160,6 +160,9 @@ async fn download_config(task_id: usize, blocking_duration: Duration, rounds: us
 }
 
 fn main() {
+    #[cfg(feature = "console")]
+    console_subscriber::init();
+
     let args = Args::parse();
 
     let rt = tokio::runtime::Builder::new_multi_thread()

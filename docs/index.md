@@ -300,7 +300,46 @@ The cost of `spawn_blocking` is one cross-thread dispatch (the closure is sent t
 
 Prevention requires knowing where blocking code exists, but some blocking calls are buried in dependencies or are intermittent (a file read that only blocks when the page is not cached). For these cases, runtime detection is necessary.
 
-`tokio-console` is the primary tool. It is a diagnostic tool that connects to a running Tokio application via a subscriber and displays real-time information about tasks and worker threads. The key metric is task poll duration: the time between a worker calling `poll` on a task and the `poll` returning. In a healthy application, poll durations are microseconds. A task that contains blocking code will show poll durations in the milliseconds or longer. `tokio-console` also shows worker thread utilization: a worker that is blocked will appear as "busy" (from the runtime's perspective, it is inside a `poll` call) with zero task throughput.
+tokio-console reveals executor starvation, but indirectly. Consider these two runs with identical parameters except for one additional blocking task:
+
+**3 blockers (one free worker remains):**
+
+![tokio-console showing 3 blockers](task-starvation-3-blockers.png)
+
+**4 blockers (zero free workers):**
+
+![tokio-console showing 4 blockers](task-starvation-4-blockers.png)
+
+The cliff is visible in the numbers. Here are the top 5 async tasks from each run:
+
+| Run | Task | Sched | Busy | Polls | Sched:Busy Ratio |
+|-----|------|-------|------|-------|------------------|
+| 3 blockers | 9 | 2.2s | 6ms | 337 | 367:1 |
+| 3 blockers | 10 | 2.0s | 6ms | 306 | 333:1 |
+| 3 blockers | 11 | 2.3s | 6ms | 351 | 383:1 |
+| 3 blockers | 12 | 2.5s | 7ms | 382 | 357:1 |
+| 3 blockers | 13 | 2.0s | 6ms | 308 | 333:1 |
+| **4 blockers** | 9 | **6.6s** | 10ms | 656 | **660:1** |
+| **4 blockers** | 10 | **7.2s** | 11ms | 727 | **655:1** |
+| **4 blockers** | 11 | **6.5s** | 10ms | 645 | **650:1** |
+| **4 blockers** | 12 | **6.8s** | 11ms | 677 | **618:1** |
+| **4 blockers** | 13 | **6.6s** | 10ms | 653 | **660:1** |
+
+With one fewer free worker, scheduling delay triples. The async tasks spend 6-7 seconds waiting for a worker (Sched) but only 10-11 milliseconds actually executing (Busy). This 650:1 ratio is the starvation that causes timeouts.
+
+Notice what you don't see: the blocking tasks themselves don't appear with long poll durations. The blocking happens in the kernel—workers are asleep in `std::thread::sleep`—which is invisible to the runtime. tokio-console shows the symptom (starvation) not the cause (blocking code).
+
+To interpret this correctly, you need to know that "Sched" is scheduling delay and "Busy" is poll duration. A high Sched-to-Busy ratio indicates workers are unavailable. Without this context, the data is just numbers.
+
+The transition from 3 to 4 blockers represents the **saturation point**: when blocking tasks equal worker threads. This is the cliff.
+
+**With 3 blockers (one free worker):** The system is "limping." The fourth worker cycles through hundreds of tasks, giving each tiny slices of CPU time. Tasks wait 2-3 seconds but eventually complete. The async runtime is still functioning—badly, but functioning.
+
+**With 4 blockers (zero free workers):** The system enters "lockdown." Every worker is occupied. The async nature of the program effectively evaporates, leaving a synchronous system that has run out of threads. Tasks wait 6-7 seconds for 10ms of work. The self-healing mechanism has collapsed.
+
+This explains why the cliff is sharp rather than gradual. The ratio of blocked workers to total workers crosses 1.0, and the system transitions from degraded to nonfunctional. The Sched:Busy ratio jumps from ~350:1 to ~650:1—not a linear increase, but a threshold effect.
+
+A note on deceptive metrics: instrumentation itself requires CPU time. When the system is paralyzed, it cannot even report how badly it's failing. The "dropped events" metric in tokio-console can underestimate the true damage during severe starvation, because the code responsible for sending telemetry cannot get a turn on the CPU.
 
 The `tokio::runtime::metrics` API provides programmatic access to the same data. `RuntimeMetrics::worker_poll_count` reports how many tasks each worker has polled. A blocked worker will show a poll count that falls behind other workers. `RuntimeMetrics::worker_busy_duration` reports how long each worker has spent inside `poll` calls. A worker that is blocked will show high busy duration with disproportionately low poll count: it is spending all its time inside a single `poll` call rather than cycling through many tasks. Emitting these metrics to a monitoring system (Prometheus, Datadog, CloudWatch) and alerting on divergence between workers is a direct signal of blocking in the runtime.
 

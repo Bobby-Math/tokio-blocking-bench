@@ -9,6 +9,12 @@ tokio = { version = "1", features = ["full"] }
 hdrhistogram = "7"
 clap = { version = "4", features = ["derive"] }
 
+# Optional: for tokio-console diagnostics
+console-subscriber = { version = "0.1", optional = true }
+
+[features]
+console = ["dep:console-subscriber"]
+
 [profile.release]
 opt-level = 3
 lto = "thin"
