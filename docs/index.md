@@ -6,7 +6,31 @@ title: ""
 
 ## The Demonstration
 
-### The execution model
+### The panic that shouldn't happen
+
+I was working on an async Rust library that managed multiple concurrent event streams using `tokio::select!`. The library polled four different sources continuously, spawned tasks for parallel device operations, and coordinated state through several mutex-protected caches.
+
+I tested it independently and it worked perfectly.
+
+I tested it in integration and it worked perfectly.
+
+Then I integrated it into the production codebase and the runtime collapsed. Panic with no stack trace, no error message, no useful diagnostics whatsoever. This was Rust, the language that catches everything at compile time. Yet here it was failing catastrophically with zero indication of why.
+
+I asked the other developers if my async code was the problem. They told me they were using async with the same integration points and it worked fine for them.
+
+I was baffled. My code was correct. Their code was correct. The integration points were identical. Why was my library crashing the runtime?
+
+The answer lay not in my code, but in a three-line blocking call in the main codebase. When I finally tracked it down and replaced it with its async equivalent, everything worked.
+
+The blocking code had been there for months. It wasn't a problem for the other libraries because their workloads never pushed the runtime hard enough. But my library, with its heavy concurrent stream processing, pushed the worker pool past its breaking point.
+
+I felt like the language had betrayed me. Rust catches data races, use-after-free, missing error handling. But it doesn't catch when you silently starve the executor.
+
+This article is what I wished I'd known that day.
+
+### Understanding the crash
+
+To understand why my library crashed while the others didn't, we need to look at how Tokio actually runs your code.
 
 Three levels of execution: hardware threads, worker threads, and tasks. Each level multiplexes onto the one below it.
 
@@ -17,7 +41,11 @@ Your code spawns tasks via tokio::spawn. These are the state machines the compil
 A task has no thread of its own. It borrows a worker thread for microseconds during each poll() call, then yields. Between yield points, the worker is free to poll other tasks, check the I/O driver for readiness events via mio, or steal work from other workers' queues.
 On a 4-vCPU machine, 4 worker threads cycle through thousands of tasks. The ratio of tasks to workers gives async Rust its efficiency, and its most insidious failure mode.
 
-### The scenario
+### From my specific case to the general problem
+
+Once I understood that blocking code had caused the crash, I wanted to know whether this was a rare edge case or a systemic problem. The more I investigated, the more I realized that my experience was not unique. It was an instance of a general, non-obvious failure mode that affects any async service when blocking calls overlap.
+
+Here is the model of what was happening in that codebase, generalized to make the mechanism visible.
 
 Consider a production service built on this model.
 
@@ -93,7 +121,7 @@ The benchmark repository includes [demonstrations of all three triggers](ADDITIO
 
 ---
 
-## What a Tokio Worker Thread Actually Does
+## What I Learned: How Tokio Workers Actually Run
 
 Each worker thread runs a `poll` loop: pull a task from a queue, call `poll()` on it, and check the I/O driver for readiness events. The `poll()` method returns `Poll::Ready` when the task is complete, or `Poll::Pending` when the task cannot make progress yet. When a task returns Pending, it registers a Waker with the I/O source it is waiting on. When that source becomes ready, it calls `waker.wake()`, placing the task back on a run queue. This is cooperative scheduling: tasks yield voluntarily, and the runtime resumes them only when they declare they can make progress.
 
@@ -103,7 +131,7 @@ This is the mechanism that allows one free worker to absorb the load of blocked 
 
 ---
 
-## What Blocking Does to the Poll Loop
+## How Blocking Breaks the Poll Loop
 
 Now consider what happens when a task calls `std::thread::sleep`, `reqwest::blocking::get`, `std::fs::read`, or any other function that blocks the OS thread.
 
@@ -164,7 +192,7 @@ This is a cliff, not gradual degradation. [The demonstration](#the-demonstration
 
 ## The Benchmark
 
-The demonstration in [the previous section](#the-demonstration) showed the cliff through operational failures: timeouts and cascading errors. To understand the cliff with more precision, we need to measure the scheduling overhead directly.
+The demonstration in [the previous section](#the-demonstration) showed the cliff through operational failures: timeouts and cascading errors. I wanted to see the cliff with more precision, so I built a benchmark to measure the scheduling delay directly.
 
 Each async task performs 10 sequential operations of `tokio::time::sleep(10ms)` and records the overhead: actual elapsed time minus the expected 100ms. This overhead represents pure scheduling delay, the time a task waits in the ready queue after its Waker fires. Blocking tasks call `std::thread::sleep(50ms)` to simulate synchronous code that freezes a worker thread.
 
@@ -297,6 +325,12 @@ The cost of `spawn_blocking` is one cross-thread dispatch (the closure is sent t
 ### Detecting blocking at runtime
 
 Prevention requires knowing where blocking code exists, but some blocking calls are buried in dependencies or are intermittent (a file read that only blocks when the page is not cached). For these cases, runtime detection is necessary.
+
+### Why standard diagnostics failed me
+
+When I was debugging this production issue, standard tools were useless. The panic traces pointed everywhere except the actual cause. Stack traces, CPU profilers, application logs, p50-based monitoring, code review, none of them revealed the problem. The blocking code completed successfully, logged no errors, and appeared in no failure trace.
+
+What finally revealed the answer was runtime introspection into the executor itself.
 
 tokio-console reveals executor starvation, but indirectly. Consider these two runs with identical parameters except for one additional blocking task:
 
