@@ -4,7 +4,7 @@ title: ""
 
 # Executor Starvation in Async Rust: The Hidden Cost of Blocking Code
 
-## Section 1: The Demonstration
+## The Demonstration
 
 ### The execution model
 
@@ -93,7 +93,7 @@ The benchmark repository includes [demonstrations of all three triggers](ADDITIO
 
 ---
 
-## Section 2: What a Tokio Worker Thread Actually Does
+## What a Tokio Worker Thread Actually Does
 
 Each worker thread runs a `poll` loop: pull a task from a queue, call `poll()` on it, and check the I/O driver for readiness events. The `poll()` method returns `Poll::Ready` when the task is complete, or `Poll::Pending` when the task cannot make progress yet. When a task returns Pending, it registers a Waker with the I/O source it is waiting on. When that source becomes ready, it calls `waker.wake()`, placing the task back on a run queue. This is cooperative scheduling: tasks yield voluntarily, and the runtime resumes them only when they declare they can make progress.
 
@@ -103,7 +103,7 @@ This is the mechanism that allows one free worker to absorb the load of blocked 
 
 ---
 
-## Section 3: What Blocking Does to the Poll Loop
+## What Blocking Does to the Poll Loop
 
 Now consider what happens when a task calls `std::thread::sleep`, `reqwest::blocking::get`, `std::fs::read`, or any other function that blocks the OS thread.
 
@@ -163,13 +163,13 @@ At low concurrency, blocking calls rarely overlap. If one worker is blocked, the
 
 The self-healing breaks when blocking calls overlap enough to saturate the worker pool. When the number of blocked workers equals the total worker count, there are zero free workers running the poll loop. No tasks are polled. No I/O events are checked. No work-stealing happens.
 
-This is a cliff, not gradual degradation. Section 1 showed this empirically: zero failures at 15 concurrent requests, 94% at 50. The threshold is determined by the ratio of blocked workers to total workers. Below 1.0, the system self-heals. At 1.0, every async task is starved.
+This is a cliff, not gradual degradation. [The demonstration](#the-demonstration) showed this empirically: zero failures at 15 concurrent requests, 94% at 50. The threshold is determined by the ratio of blocked workers to total workers. Below 1.0, the system self-heals. At 1.0, every async task is starved.
 
 ---
 
-## Section 4: The Benchmark
+## The Benchmark
 
-The demonstration in Section 1 showed the cliff through operational failures: timeouts and cascading errors. To understand the cliff with more precision, we need to measure the scheduling overhead directly.
+The demonstration in [the previous section](#the-demonstration) showed the cliff through operational failures: timeouts and cascading errors. To understand the cliff with more precision, we need to measure the scheduling overhead directly.
 
 ### Results
 
@@ -199,9 +199,9 @@ On 4 workers, the cliff appears at roughly 20 concurrent requests with 30% block
 
 ---
 
-## Section 5: From Scheduling Delay to Panic
+## From Scheduling Delay to Panic
 
-Sections 3 and 4 established that blocking code inflates scheduling overhead from microseconds to hundreds of milliseconds. That overhead, by itself, does not cause a panic. A task that takes 150 milliseconds instead of 10 milliseconds is slow, but slow is not broken. The panic comes from a secondary mechanism that converts latency into an error. 
+[The section on blocking mechanics](#what-blocking-does-to-the-poll-loop) and [the benchmark](#the-benchmark) established that blocking code inflates scheduling overhead from microseconds to hundreds of milliseconds. That overhead, by itself, does not cause a panic. A task that takes 150 milliseconds instead of 10 milliseconds is slow, but slow is not broken. The panic comes from a secondary mechanism that converts latency into an error. 
 
 There are four common mechanisms in production async services, and all four are triggered by the same scheduling delay.
 
@@ -237,7 +237,7 @@ The failure is visible only to tokio-console (per-task poll latency), runtime me
 
 ---
 
-## Section 6: Detection and Prevention
+## Detection and Prevention
 
 ### Identifying blocking code
 
