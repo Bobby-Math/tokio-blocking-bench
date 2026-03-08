@@ -14,7 +14,7 @@ Hardware threads are the logical CPUs your processor exposes: one per vCPU on AW
 
 Your code spawns tasks via tokio::spawn. These are the state machines the compiler generates from your async fn, with each .await point compiled into a state transition that yields control back to the worker.
 
-A task has no thread on it's own. It borrows a worker thread for microseconds during each poll() call, then yields. Between yield points, the worker is free to poll other tasks, check the I/O driver for readiness events via mio, or steal work from other workers' queues.
+A task has no thread of its own. It borrows a worker thread for microseconds during each poll() call, then yields. Between yield points, the worker is free to poll other tasks, check the I/O driver for readiness events via mio, or steal work from other workers' queues.
 On a 4-vCPU machine, 4 worker threads cycle through thousands of tasks. The ratio of tasks to workers gives async Rust its efficiency, and its most insidious failure mode.
 
 ### The scenario
@@ -138,11 +138,6 @@ A file read might return in 50 microseconds if the page is cached, or 5 millisec
 
 The compiler cannot distinguish this from legitimate CPU work that happens to take a long time. Static analysis cannot determine, in the general case, whether a function call will block. Blocking is a runtime property that depends on the kernel, the device, the network, and the current system load.
 
-This is not a limitation of Rust's compiler design. It is a fundamental limitation of static analysis. Rice's theorem proves that all non-trivial semantic properties of programs are undecidable. Whether a function call will block the thread is a semantic property of the function's behavior, not its syntax. 
-
-No static analysis tool can, in the general case, distinguish a blocking call from a long-running computation. The Church-Turing thesis tells us that this is not a technical debt item to be fixed; it is a mathematical certainty.
-
-
 ### How blocking code enters async codebases
 
 Given that the compiler cannot help, blocking code enters production through several well-worn paths:
@@ -150,7 +145,7 @@ Given that the compiler cannot help, blocking code enters production through sev
 - Pre-async code: Utility functions that load config, parse static data, or read feature flags remain synchronous after a migration to async. They work correctly and are never rewritten.
 - The standard library: std::fs, std::net, and std::thread are synchronous. A developer who reaches for these out of habit writes code that compiles without warning. Tokio provides async equivalents, but the compiler does not suggest them.
 - Non-obvious blocking: println! to a slow stdout, serde_json::from_slice on large payloads, env::var under contention. These do not look like blocking I/O in code review.
-- FFI calls: Any call into a C library is blocking by default. Crypto libraries, compression, DNS resolution via libc—they all block the calling thread.
+- FFI calls: Any call into a C library is blocking by default. Crypto libraries, compression, DNS resolution via libc; these all block the calling thread.
 - Transitive dependencies: A crate three layers deep calls std::fs::metadata or reqwest::blocking::get. You never see it in your source code. It compiles, passes CI, and blocks in production.
 
 Across all paths, the blocking code is correct. It produces the right output. The defect is not in what the code does, but in where it runs.
@@ -171,6 +166,8 @@ This is a cliff, not gradual degradation. [The demonstration](#the-demonstration
 
 The demonstration in [the previous section](#the-demonstration) showed the cliff through operational failures: timeouts and cascading errors. To understand the cliff with more precision, we need to measure the scheduling overhead directly.
 
+Each async task performs 10 sequential operations of `tokio::time::sleep(10ms)` and records the overhead: actual elapsed time minus the expected 100ms. This overhead represents pure scheduling delay, the time a task waits in the ready queue after its Waker fires. Blocking tasks call `std::thread::sleep(50ms)` to simulate synchronous code that freezes a worker thread.
+
 ### Results
 
 The benchmark ran on an EC2 c6i.xlarge instance (4 vCPUs, 8 GB RAM) with Tokio configured for 4 worker threads. Each scenario ran 3 times; the table below shows representative results from Run 1 (all runs showed the same pattern).
@@ -187,9 +184,11 @@ high-async/4-blockers          4    500      4      1300    140415     150271
 
 ### Three observations
 
-The cliff is real and sharp. With 3 blockers on 4 workers, p99 is 1.5ms. With 4 blockers, p99 is 140ms—a 90x increase from one task. The system does not degrade linearly; it collapses when blocked workers equal total workers.
+The cliff is real and sharp. With 3 blockers on 4 workers, p99 is 1.5ms. With 4 blockers, p99 is 140ms. This is a 90x increase from one task. The system does not degrade linearly; it collapses when blocked workers equal total workers.
 
 p50 is blind to the problem. At 3 blockers, p50 is 1,310μs. At 4 blockers, p50 is 1,300μs. The median is virtually unchanged. The damage is entirely in the tail.
+
+The p99:p50 ratio reveals the cliff: from 1.2:1 at 3 blockers to 108:1 at 4 blockers. At 4 blockers, the system is bimodal. The median task completes in 1.3ms, but the 99th percentile waits 140ms. The median and the tail are in different worlds.
 
 One worker is the margin. The difference between 3 and 4 blockers is the difference between one free worker and zero. With one free worker, the system self-heals. With zero, p99 explodes by two orders of magnitude.
 
@@ -225,11 +224,10 @@ The timeline the team observes is: workload increased (or a new library was inte
 
 This failure mode evades standard diagnostics:
 
-- Stack traces: The blocking code is not in the panicking task's call stack. The panic originates in timeouts, channel operations, or pool
-acquisitions—none of which reference the function that blocked the worker.
+- Stack traces: The blocking code is not in the panicking task's call stack. The panic originates in timeouts, channel operations, or pool acquisitions. None of these reference the function that blocked the worker.
 - CPU profilers: Blocking code waits on I/O, consuming negligible CPU. Flame graphs show it as a thin sliver with no on-CPU samples.
 - Application logs: The blocking code logs "config downloaded" or "file read complete." The async code logs "timeout exceeded" or "connection pool exhausted." No log entry connects them.
-- p50-based monitoring: p50 increases by less than 9% even at full blockage. A median-latency dashboard shows a healthy service while 1% of requests experience 140ms of scheduling delay.
+- p50-based monitoring: p50 increases by less than 6% even at full blockage. A median-latency dashboard shows a healthy service while 1% of requests experience 140ms of scheduling delay.
 - Code review: The blocking code is correct and well-tested. It would pass any review. The defect is contextual: safe in synchronous code,
 hazardous in async code.
 
@@ -327,17 +325,17 @@ The cliff is visible in the numbers. Here are the top 5 async tasks from each ru
 
 With one fewer free worker, scheduling delay triples. The async tasks spend 6-7 seconds waiting for a worker (Sched) but only 10-11 milliseconds actually executing (Busy). This 650:1 ratio is the starvation that causes timeouts.
 
-Notice what you don't see: the blocking tasks themselves don't appear with long poll durations. The blocking happens in the kernel—workers are asleep in `std::thread::sleep`—which is invisible to the runtime. tokio-console shows the symptom (starvation) not the cause (blocking code).
+Notice what you do not see: the blocking tasks themselves do not appear with long poll durations. The blocking happens in the kernel; workers are asleep in `std::thread::sleep`, which is invisible to the runtime. tokio-console shows the symptom (starvation) not the cause (blocking code).
 
 To interpret this correctly, you need to know that "Sched" is scheduling delay and "Busy" is poll duration. A high Sched-to-Busy ratio indicates workers are unavailable. Without this context, the data is just numbers.
 
 The transition from 3 to 4 blockers represents the **saturation point**: when blocking tasks equal worker threads. This is the cliff.
 
-**With 3 blockers (one free worker):** The system is "limping." The fourth worker cycles through hundreds of tasks, giving each tiny slices of CPU time. Tasks wait 2-3 seconds but eventually complete. The async runtime is still functioning—badly, but functioning.
+**With 3 blockers (one free worker):** The system is "limping." The fourth worker cycles through hundreds of tasks, giving each tiny slices of CPU time. Tasks wait 2-3 seconds but eventually complete. The async runtime is still functioning, badly but functioning.
 
 **With 4 blockers (zero free workers):** The system enters "lockdown." Every worker is occupied. The async nature of the program effectively evaporates, leaving a synchronous system that has run out of threads. Tasks wait 6-7 seconds for 10ms of work. The self-healing mechanism has collapsed.
 
-This explains why the cliff is sharp rather than gradual. The ratio of blocked workers to total workers crosses 1.0, and the system transitions from degraded to nonfunctional. The Sched:Busy ratio jumps from ~350:1 to ~650:1—not a linear increase, but a threshold effect.
+This explains why the cliff is sharp rather than gradual. The ratio of blocked workers to total workers crosses 1.0, and the system transitions from degraded to nonfunctional. The Sched:Busy ratio jumps from ~350:1 to ~650:1. This is not a linear increase, but a threshold effect.
 
 A note on deceptive metrics: instrumentation itself requires CPU time. When the system is paralyzed, it cannot even report how badly it's failing. The "dropped events" metric in tokio-console can underestimate the true damage during severe starvation, because the code responsible for sending telemetry cannot get a turn on the CPU.
 
@@ -357,7 +355,7 @@ The Tokio multi-threaded runtime is a cooperative system. Its performance depend
 
 Spare worker capacity absorbs the damage. Work-stealing redistributes tasks from blocked workers to free ones. As long as one worker remains free, the system self-heals and latency stays bounded. When the last free worker is lost, the self-healing mechanism collapses and scheduling delay jumps by two orders of magnitude.
 
-The benchmark in this article measured the cliff with precision: p99 scheduling overhead increased from 1.5 milliseconds to 140 milliseconds when the last free worker was blocked, while p50 increased by less than 9%. The demonstration showed the cliff in operational terms: the same blocking code produced zero failures at 15 concurrent requests and a 94% failure rate at 50 concurrent requests. In both cases, the blocking code completed successfully, returned correct data, logged no errors, and appeared in no failure trace.
+The benchmark in this article measured the cliff with precision: p99 scheduling overhead increased from 1.5 milliseconds to 140 milliseconds when the last free worker was blocked, while p50 increased by less than 6%. The demonstration showed the cliff in operational terms: the same blocking code produced zero failures at 15 concurrent requests and a 94% failure rate at 50 concurrent requests. In both cases, the blocking code completed successfully, returned correct data, logged no errors, and appeared in no failure trace.
 
 The failure paths are varied (timeouts, channel backpressure, connection pool exhaustion, mutex contention) but the root cause is singular: a worker thread that cannot run its poll loop. Every diagnostic artifact (stack traces, logs, metrics, profiler output) points at the async code that failed, not at the blocking code that caused the failure.
 
