@@ -123,6 +123,8 @@ The benchmark repository includes [demonstrations of all three triggers](ADDITIO
 
 ## What I Learned: How Tokio Workers Actually Run
 
+To understand why this happened, I had to learn how Tokio actually executes code.
+
 Each worker thread runs a `poll` loop: pull a task from a queue, call `poll()` on it, and check the I/O driver for readiness events. The `poll()` method returns `Poll::Ready` when the task is complete, or `Poll::Pending` when the task cannot make progress yet. When a task returns Pending, it registers a Waker with the I/O source it is waiting on. When that source becomes ready, it calls `waker.wake()`, placing the task back on a run queue. This is cooperative scheduling: tasks yield voluntarily, and the runtime resumes them only when they declare they can make progress.
 
 The Rust compiler transforms every async fn into a state machine, with each .await point becoming a state transition. A worker is occupied only during the brief moments between .await points, typically microseconds. The I/O operation might take 5 milliseconds, but the worker is held for microseconds. Each worker maintains a local task queue, and when a worker's queue is empty, it steals tasks from other workers' queues. 
@@ -263,7 +265,7 @@ The failure is visible only to tokio-console (per-task poll latency), runtime me
 
 ---
 
-## Detection and Prevention
+## How do we stop this from happening again?
 
 ### Identifying blocking code
 
@@ -377,7 +379,7 @@ The `tokio::runtime::metrics` API provides programmatic access to the same data.
 
 ### The engineering rule
 
-The guidance condenses to a single rule: if a function touches the network, reads from or writes to disk, calls into a C library through FFI, or runs CPU-intensive computation for more than a few hundred microseconds, it does not belong inside an async task without either an async equivalent or `spawn_blocking`.
+If I could boil everything I learned down to one rule of thumb, it's this: if a function touches the network, reads from or writes to disk, calls into a C library through FFI, or runs CPU-intensive computation for more than a few hundred microseconds, it does not belong inside an async task without either an async equivalent or `spawn_blocking`.
 
 Treat this rule with the same discipline applied to `unsafe` code. `unsafe` tells the compiler: "I am taking responsibility for a safety invariant you cannot verify." A blocking call inside an async task is the scheduling equivalent: "I am taking responsibility for the cooperative contract the runtime cannot enforce." The difference is that `unsafe` requires an explicit keyword. Blocking requires nothing. The compiler will not catch it. The tests will not catch it (unless they run at production-level concurrency). The staging environment will not catch it (unless it matches production load patterns). Only understanding the runtime beneath your code will catch it.
 
