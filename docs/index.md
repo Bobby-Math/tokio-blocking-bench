@@ -214,9 +214,9 @@ high-async/4-blockers          4    500      4      1300    140415     150271
 
 ### Three observations
 
-The cliff is real and sharp. With 3 blockers on 4 workers, p99 is 1.5ms. With 4 blockers, p99 is 140ms. This is a 90x increase from one task. The system does not degrade linearly; it collapses when blocked workers equal total workers.
+The cliff is real and sharp. With 3 blockers on 4 workers, p99 (99th percentile latency) is 1.5ms. With 4 blockers, p99 is 140ms. This is a 90x increase from one task. The system does not degrade linearly; it collapses when blocked workers equal total workers.
 
-p50 is blind to the problem. At 3 blockers, p50 is 1,310μs. At 4 blockers, p50 is 1,300μs. The median is virtually unchanged. The damage is entirely in the tail.
+p50 (median latency) is blind to the problem. At 3 blockers, p50 is 1,310μs. At 4 blockers, p50 is 1,300μs. The median is virtually unchanged. The damage is entirely in the tail.
 
 The p99:p50 ratio reveals the cliff: from 1.2:1 at 3 blockers to 108:1 at 4 blockers. At 4 blockers, the system is bimodal. The median task completes in 1.3ms, but the 99th percentile waits 140ms. The median and the tail are in different worlds.
 
@@ -230,7 +230,7 @@ On 4 workers, the cliff appears at roughly 20 concurrent requests with 30% block
 
 ## From Scheduling Delay to Panic
 
-[The section on blocking mechanics](#what-blocking-does-to-the-poll-loop) and [the benchmark](#the-benchmark) established that blocking code inflates scheduling overhead from microseconds to hundreds of milliseconds. That overhead, by itself, does not cause a panic. A task that takes 150 milliseconds instead of 10 milliseconds is slow, but slow is not broken. The panic comes from a secondary mechanism that converts latency into an error. 
+[The section on blocking mechanics](#how-blocking-breaks-the-poll-loop) and [the benchmark](#the-benchmark) established that blocking code inflates scheduling overhead from microseconds to hundreds of milliseconds. That overhead, by itself, does not cause a panic. A task that takes 150 milliseconds instead of 10 milliseconds is slow, but slow is not broken. The panic comes from a secondary mechanism that converts latency into an error. 
 
 There are four common mechanisms in production async services, and all four are triggered by the same scheduling delay.
 
@@ -375,7 +375,7 @@ This explains why the cliff is sharp rather than gradual. The ratio of blocked w
 
 A note on deceptive metrics: instrumentation itself requires CPU time. When the system is paralyzed, it cannot even report how badly it's failing. The "dropped events" metric in tokio-console can underestimate the true damage during severe starvation, because the code responsible for sending telemetry cannot get a turn on the CPU.
 
-The `tokio::runtime::metrics` API provides programmatic access to the same data. `RuntimeMetrics::worker_poll_count` reports how many tasks each worker has polled. A blocked worker will show a poll count that falls behind other workers. `RuntimeMetrics::worker_busy_duration` reports how long each worker has spent inside `poll` calls. A worker that is blocked will show high busy duration with disproportionately low poll count: it is spending all its time inside a single `poll` call rather than cycling through many tasks. Emitting these metrics to a monitoring system (Prometheus, Datadog, CloudWatch) and alerting on divergence between workers is a direct signal of blocking in the runtime.
+For production environments where tokio-console isn't practical, the `tokio::runtime::metrics` API provides programmatic access to similar runtime metrics. `RuntimeMetrics::worker_poll_count` reports how many tasks each worker has polled. A blocked worker will show a poll count that falls behind other workers. `RuntimeMetrics::worker_busy_duration` reports how long each worker has spent inside `poll` calls. A worker that is blocked will show high busy duration with disproportionately low poll count: it is spending all its time inside a single `poll` call rather than cycling through many tasks. Emitting these metrics to a monitoring system (Prometheus, Datadog, CloudWatch) and alerting on divergence between workers is a direct signal of blocking in the runtime.
 
 ### The engineering rule
 
