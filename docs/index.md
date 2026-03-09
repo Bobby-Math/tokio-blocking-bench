@@ -375,6 +375,8 @@ This explains why the cliff is sharp rather than gradual. The ratio of blocked w
 
 A note on deceptive metrics: instrumentation itself requires CPU time. When the system is paralyzed, it cannot even report how badly it's failing. The "dropped events" metric in tokio-console can underestimate the true damage during severe starvation, because the code responsible for sending telemetry cannot get a turn on the CPU.
 
+The table above shows task-level poll counts (how many times each individual task was polled). The metrics API below provides worker-level poll counts (how many polls each worker thread has performed across all tasks). These are two different metrics for two different monitoring approaches.
+
 For production environments where tokio-console isn't practical, the `tokio::runtime::metrics` API provides programmatic access to similar runtime metrics. `RuntimeMetrics::worker_poll_count` reports how many tasks each worker has polled. A blocked worker will show a poll count that falls behind other workers. `RuntimeMetrics::worker_busy_duration` reports how long each worker has spent inside `poll` calls. A worker that is blocked will show high busy duration with disproportionately low poll count: it is spending all its time inside a single `poll` call rather than cycling through many tasks. Emitting these metrics to a monitoring system (Prometheus, Datadog, CloudWatch) and alerting on divergence between workers is a direct signal of blocking in the runtime.
 
 ### The engineering rule
