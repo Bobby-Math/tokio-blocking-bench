@@ -196,7 +196,7 @@ This is a cliff, not gradual degradation. [The demonstration](#the-demonstration
 
 The demonstration in [the previous section](#the-demonstration) showed the cliff through operational failures: timeouts and cascading errors. I wanted to see the cliff with more precision, so I built a benchmark to measure the scheduling delay directly.
 
-Each async task performs 10 sequential operations of `tokio::time::sleep(10ms)` and records the overhead: actual elapsed time minus the expected 100ms. This overhead represents pure scheduling delay, the time a task waits in the ready queue after its Waker fires. Blocking tasks call `std::thread::sleep(50ms)` to simulate synchronous code that freezes a worker thread.
+Each async task performs 10 sequential `tokio::time::sleep(10ms)` calls. For each sleep, we record the overhead as actual elapsed time minus the expected 10ms. In a healthy runtime, that overhead stays near zero. Under executor starvation, the timer may fire on time, but the task can sit waiting for a free worker before it is polled again, and that extra wait shows up as overhead. Blocking tasks call `std::thread::sleep(50ms)` to simulate synchronous code that freezes a worker thread.
 
 ### Results
 
