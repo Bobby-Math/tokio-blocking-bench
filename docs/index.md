@@ -35,8 +35,6 @@ When you block a worker thread, you hold that worker hostage and paralyze the en
 
 Once I understood that blocking code had caused the crash, I wanted to know whether this was a rare edge case or a systemic problem. The more I investigated, the more I realized that my experience was not unique. It was an instance of a general, non-obvious failure mode that affects any async service when blocking calls overlap.
 
-Here is the model of what was happening in that codebase, generalized to make the mechanism visible.
-
 Consider a production service built on this model.
 
 The service handles incoming requests asynchronously across four worker threads.
@@ -70,13 +68,7 @@ The blocking code completed successfully and logged zero errors. It never appear
 
 In reality, your handlers are victims. They are never being polled because the worker threads are occupied elsewhere. The source of the problem is the only thing that appears healthy.
 
-### Other triggers
-
-The same cliff can be reached through two other paths: adding more blocking code to a fixed workload, or increasing async task count against fixed blocking.
-
-The mechanism is identical in all cases; only the trigger differs.
-
-The benchmark repository includes [demonstrations of all three triggers](ADDITIONAL_DEMOS.md).
+The same saturation cliff appears under other triggers as well, including adding blocking work to a fixed workload or increasing async task count against fixed blocking; both are shown in the [additional demonstrations](ADDITIONAL_DEMOS.md).
 
 ---
 
@@ -133,7 +125,7 @@ This is a cliff, not gradual degradation. [The demonstration](#the-demonstration
 
 ## The Benchmark
 
-The demonstration in [the previous section](#the-demonstration) showed the cliff through operational failures: timeouts and cascading errors. I wanted to see the cliff with more precision, so I built a benchmark to measure the scheduling delay directly.
+The failures made the cliff visible. I wanted to measure it with more granularity, so I built a benchmark that captured the scheduling delay directly.
 
 Each async task performs 10 sequential `tokio::time::sleep(10ms)` calls. For each sleep, we record the overhead as actual elapsed time minus the expected 10ms. In a healthy runtime, that overhead stays near zero. Under executor starvation, the timer may fire on time, but the task can sit waiting for a free worker before it is polled again, and that extra wait shows up as overhead. Blocking tasks call `std::thread::sleep(50ms)` to simulate synchronous code that freezes a worker thread.
 
@@ -166,12 +158,6 @@ takes 10ms, but the total is 150ms and the timeout fires.
 In all four failure paths, the error surfaces far from the blocking code. The panic trace shows a timeout inside an async handler, a channel send failure, a connection pool exhaustion error, or a lock contention timeout. The blocking code is running on a different worker thread, in a different task, with no direct call-stack relationship to the failing code. The blocking code completes successfully, returns correct data, and logs no errors.
 
 The timeline the team observes is: workload increased (or a new library was integrated, or a traffic spike occurred), then failures started. The timeline that actually matters is: blocking code existed in the codebase, then the worker pool reached saturation, then scheduling delay exceeded failure thresholds in downstream components. The first timeline is visible in deployment logs, traffic graphs, and incident reports. The second timeline is invisible without knowledge of how the Tokio worker pool operates.
-
-### Why standard diagnostics failed me
-
-When I was debugging this production issue, standard tools were useless. Stack traces pointed everywhere except the actual cause. The panic trace showed timeouts inside async handlers, channel send failures, and connection pool exhaustion. The blocking code completed successfully, logged no errors, and appeared in no failure trace.
-
-What finally revealed the answer was runtime introspection into the executor itself. The failure is visible only to tokio-console (per-task poll latency), runtime metrics (worker_poll_count divergence), and engineers who understand the cooperative scheduling contract.
 
 ---
 
@@ -267,7 +253,7 @@ The cliff is visible in the numbers. Here are the top 5 async tasks from each ru
 
 The transition from 3 to 4 blockers represents the saturation point. With one free worker, the system limps along. Tasks wait 2-3 seconds but eventually complete. With zero free workers, the system enters lockdown. Tasks wait 6-7 seconds for 10ms of work. The Sched:Busy ratio jumps from ~350:1 to ~650:1. This is a threshold effect, not a linear increase.
 
-For production monitoring, the `tokio::runtime::metrics` API provides programmatic access to similar metrics. `RuntimeMetrics::worker_poll_count` reports how many tasks each worker has polled. A blocked worker falls behind. `RuntimeMetrics::worker_busy_duration` reports time spent inside `poll` calls. A blocked worker shows high busy duration with low poll count. Emitting these metrics to your monitoring system and alerting on divergence between workers is a direct signal of blocking.
+The same starvation pattern appears in worker-level metrics, where Tokio's [`tokio::runtime::RuntimeMetrics`] exposes signals such as high busy duration and low poll count. In production, divergence between workers is a strong indicator of blocking.
 
 ### The engineering rule
 
