@@ -60,31 +60,17 @@ cargo build --release
 
 ![Per-Request Blocking: Failure Rate vs Concurrent Load](blocking_failure_cliff.png)
 
-The cliff lands between 15 and 20 concurrent requests. Zero failures at 15. Ninety-four percent failures at 50. This is not a stress test — it's the gap between manual testing and basic automated load testing.
+The cliff lands between 15 and 20 concurrent requests. Zero failures at 15. Ninety-four percent at 50. This is not a stress test. It is the gap between manual testing and basic automated load testing.
 
-### The Dynamics of Runtime Saturation
+The blocking code did not change. The blocking code did not fail. Yet the system collapsed.
 
-The blocking code did not change. The blocking code did not fail. Yet the system collapsed. Why?
-
-Consider a service with four worker threads. A synchronous function — a config fetch, a DNS lookup, a file read — sits in a code path that 30% of requests traverse. The function takes 50ms, completes successfully, and logs no errors.
-
-At low traffic, blocking calls rarely overlap. The worker pool absorbs them. One worker blocks, the other three continue their poll loop, stealing tasks from the blocked worker's queue. The system stays healthy.
-
-As traffic scales, blocking calls overlap. When four concurrent requests hit the synchronous path simultaneously, the entire worker pool is occupied. The runtime cannot poll new tasks, process I/O, or handle heartbeats. The system collapses not because the code changed, but because the traffic level finally exposed the mechanical betrayal of the executor.
+Consider a service with four worker threads. A synchronous function, such as a config fetch or file read, sits in a code path that 30% of requests traverse. At low traffic, blocking calls rarely overlap. The worker pool absorbs them. As traffic scales, blocking calls overlap. When four concurrent requests hit the synchronous path simultaneously, the entire worker pool is occupied.
 
 ### Why standard debugging fails
 
-This failure mode is particularly insidious because it subverts standard debugging intuition. To a developer triaging the collapse, the symptoms are deceptive:
+The blocking code completed successfully and logged zero errors. It never appears in failure traces. When you look at the logs, you see timeouts in your async handlers. Your natural conclusion is that the handlers are too slow. You begin optimizing the wrong code.
 
-**No Code Change:** The blocking code remained identical between the stable state and the collapse.
-
-**No Functional Failure:** The blocking function completed successfully in every instance and logged zero errors.
-
-**Ghost Traces:** The blocking code never appears in a failure trace because it is the one part of the system that actually finished its work.
-
-When you look at the logs, you see timeouts occurring inside your async handlers. Your natural conclusion is that the handlers are underperforming or that the timeout thresholds are too aggressive. You begin optimizing the wrong code.
-
-In reality, your handlers are victims, not culprits. They aren't "slow"—they are simply never being polled because the worker threads are occupied elsewhere. This creates a diagnostic vacuum where the source of the problem is the only thing that appears healthy.
+In reality, your handlers are victims. They are never being polled because the worker threads are occupied elsewhere. The source of the problem is the only thing that appears healthy.
 
 ### Other triggers
 
@@ -96,27 +82,7 @@ The benchmark repository includes [demonstrations of all three triggers](ADDITIO
 
 ---
 
-## What I Learned: How Tokio Workers Actually Run
-
-To understand why this happened, I had to learn how Tokio actually executes code.
-
-Each worker thread runs a `poll` loop: pull a task from a queue, call `poll()` on it, and check the I/O driver for readiness events. The `poll()` method returns `Poll::Ready` when the task is complete, or `Poll::Pending` when the task cannot make progress yet. When a task returns Pending, it registers a Waker with the I/O source it is waiting on. When that source becomes ready, it calls `waker.wake()`, placing the task back on a run queue. This is cooperative scheduling: tasks yield voluntarily, and the runtime resumes them only when they declare they can make progress.
-
-The Rust compiler transforms every async fn into a state machine, with each .await point becoming a state transition. A worker is occupied only during the brief moments between .await points, typically microseconds. The I/O operation might take 5 milliseconds, but the worker is held for microseconds. Each worker maintains a local task queue, and when a worker's queue is empty, it steals tasks from other workers' queues. 
-
-This is the mechanism that allows one free worker to absorb the load of blocked workers. The worker thread has no timeout, no preemption mechanism, and no way to distinguish a 2-microsecond poll from a 200-millisecond poll. From the worker's perspective, both are function calls that have not yet returned.
-
----
-
 ## How Blocking Breaks the Poll Loop
-
-Now consider what happens when a task calls `std::thread::sleep`, `reqwest::blocking::get`, `std::fs::read`, or any other function that blocks the OS thread.
-
-### The mechanism
-
-The blocking call does not return `Poll::Pending`. It does not register a `Waker`. It simply occupies the OS thread until the operation completes. 
-
-The worker's loop is frozen. It cannot pull the next task, cannot check the I/O driver, cannot participate in work-stealing. Every task in that worker's queue is stalled until the blocking call returns.
 
 ### Why the compiler cannot catch this
 
