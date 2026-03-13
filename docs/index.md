@@ -72,14 +72,12 @@ The immediate objection is that blocking code should not exist inside an async c
 
 And yet it happens, because Rust's compiler, which catches data races, use-after-free, dangling references, and unhandled errors at compile time, has no mechanism to detect blocking inside async.
 
-There is no trait bound that distinguishes a blocking function from a non-blocking function. There is no `#[must_not_block]` attribute in the language. Clippy has no default lint for calling `std::thread::sleep` or `std::fs::read` inside an `async fn`.
+There is no trait bound that distinguishes a blocking function from a non-blocking function. There is no `#[must_not_block]` attribute in the language.
 
 The following code compiles without any warning:
 
 ```rust
 async fn fetch_config() -> Result<Vec<u8>, std::io::Error> {
-    // This blocks the Tokio worker thread for the duration of the disk read.
-    // rustc emits no warning. Clippy emits no warning.
     let bytes = std::fs::read("/etc/app/config.toml")?;
     Ok(bytes)
 }
@@ -180,10 +178,10 @@ Across all four categories, the common factor is that the worker's poll loop can
 The simplest fix is to replace the blocking call with its async counterpart when one exists.
 
 ```rust
-// BEFORE: blocks the worker for the entire disk read.
+//BEFORE
 let config = std::fs::read("/etc/app/config.toml")?;
 
-// AFTER: yields the worker during the disk read.
+//AFTER
 let config = tokio::fs::read("/etc/app/config.toml").await?;
 ```
 
@@ -218,7 +216,14 @@ let config = tokio::task::spawn_blocking(move || {
 
 The cost of `spawn_blocking` is a cross-thread dispatch (the closure is sent to the blocking pool via a channel) and a Waker notification when the closure completes. That overhead is small compared to the hundreds of milliseconds of scheduling delay that blocking a worker thread can inflict on every other task in the runtime. The asymmetry between these costs is the engineering argument for erring on the side of `spawn_blocking` when in doubt.
 
-One caveat: `tokio::task::yield_now` is only relevant for CPU-bound loops you control. It does nothing for blocking I/O or synchronous library calls that never yield in the first place. `yield_now` helps when you control the long-running computation and can add yield points. It cannot fix a third-party library that blocks.
+`tokio::task::yield_now` does not move work off the executor. It keeps the computation on the same worker thread, but voluntarily gives that worker back between chunks of CPU work so other tasks can run. That makes it useful for long CPU loops you control, but it is not a fix for blocking I/O or heavyweight synchronous work, which still belongs in `spawn_blocking`.
+
+```rust
+for item in work_items {
+    process(item);
+    tokio::task::yield_now().await;
+}
+```
 
 ### Detecting blocking at runtime
 
@@ -253,11 +258,15 @@ The transition from 3 to 4 blockers represents the saturation point. With one fr
 
 The same starvation pattern appears in worker-level metrics, where Tokio's [`tokio::runtime::RuntimeMetrics`] exposes signals such as high busy duration and low poll count. In production, divergence between workers is a strong indicator of blocking.
 
+You can surface this failure mode earlier by testing with a deliberately small worker pool and driving concurrency against isolated async paths. That does not prove the absence of blocking, but it makes hidden starvation visible much earlier than production load does.
+
 ### The engineering rule
 
 If I could boil everything I learned down to one rule of thumb, it's this: if a function touches the network, reads from or writes to disk, calls into a C library through FFI, or runs CPU-intensive computation for more than a few hundred microseconds, it does not belong inside an async task without either an async equivalent or `spawn_blocking`.
 
-Treat this rule with the same discipline applied to `unsafe` code. We do not usually treat `async fn` with that level of respect, but code running on Tokio's worker pool depends on execution invariants the compiler does not enforce. `unsafe` tells the compiler: "I am taking responsibility for a safety invariant you cannot verify." A blocking call inside an async task is the scheduling equivalent: "I am taking responsibility for the cooperative contract the runtime cannot enforce." The difference is that `unsafe` requires an explicit keyword. Blocking requires nothing. The compiler will not catch it. The tests will not catch it (unless they run at production-level concurrency). The staging environment will not catch it (unless it matches production load patterns). Only a deep understanding of Tokio's execution model will catch it.
+Treat this rule with the same discipline applied to `unsafe` code. We do not usually treat `async fn` with that level of respect, but code running on Tokio's worker pool depends on execution invariants the compiler does not enforce. `unsafe` tells the compiler: "I am taking responsibility for a safety invariant you cannot verify." A blocking call inside an async task is the scheduling equivalent: "I am taking responsibility for the cooperative contract the runtime cannot enforce." 
+
+The difference is that `unsafe` requires an explicit keyword. Blocking requires nothing. The compiler will not catch it. The tests will not catch it (unless they run at production-level concurrency). The staging environment will not catch it (unless it matches production load patterns). Only a deep understanding of Tokio's execution model will catch it.
 
 ---
 
