@@ -21,9 +21,7 @@ This article explores the diagnostic vacuum I faced and the three-line architect
 ### Understanding the crash
 
 To diagnose why my library triggered a collapse while others remained stable, we must examine the relationship between hardware, OS threads,
-and the Tokio runtime. Tokio operates on an M:N threading model where many tasks are multiplexed onto a small number of worker threads. On a
-4-vCPU machine, Tokio typically spawns four worker threads, each running a cooperative poll loop designed to cycle through thousands of
-lightweight tasks.
+and the Tokio runtime. Tokio operates on an M:N threading model, essentially a form of green threading, where many tasks are multiplexed onto a small number of worker threads. On a 4-vCPU machine, Tokio typically spawns four worker threads, each running a cooperative poll loop designed to cycle through thousands of lightweight tasks.
 
 In a healthy system, tasks act as good citizens. A task borrows a worker thread for a few microseconds to execute logic until it hits an `.await` point. At this yield point, the task suspends its state and the worker thread is liberated to poll other tasks, check for I/O readiness, or perform work-stealing from other queues. This massive multiplexing ratio is the source of Rust's high-performance concurrency, but it introduces a single, catastrophic point of failure: the contract of cooperation.
 
@@ -45,8 +43,6 @@ At low traffic, these blocking calls rarely overlap and the worker pool absorbs 
 
 At higher traffic, multiple blocking calls land simultaneously, saturating the pool.
 
-The blocking code does not change. Only the traffic level changes.
-
 To reproduce these results, build and run the demo:
 
 ```bash
@@ -57,8 +53,6 @@ cargo build --release
 ![Per-Request Blocking: Failure Rate vs Concurrent Load](blocking_failure_cliff.png)
 
 The cliff lands between 15 and 20 concurrent requests. Zero failures at 15. Ninety-four percent at 50. This is not a stress test. It is the gap between manual testing and basic automated load testing.
-
-The blocking code did not change. The blocking code did not fail. Yet the system collapsed.
 
 ### Why standard debugging fails
 
@@ -118,6 +112,8 @@ The point where blocking transitions from invisible to catastrophic.
 At low concurrency, blocking calls rarely overlap. If one worker is blocked, the other three continue their poll loop, stealing tasks from the blocked worker's queue. The stolen tasks experience some additional latency, but the system stays within timeout thresholds. The service appears healthy.
 
 The self-healing breaks when blocking calls overlap enough to saturate the worker pool. When the number of blocked workers equals the total worker count, there are zero free workers running the poll loop. No tasks are polled. No I/O events are checked. No work-stealing happens.
+
+Even before total saturation, blocking steals polling capacity from the executor, so the runtime can no longer translate available hardware into the async throughput and latency that machine should be able to deliver.
 
 This is a cliff, not gradual degradation. [The demonstration](#the-demonstration) showed this empirically: zero failures at 15 concurrent requests, 94% at 50. The threshold is determined by the ratio of blocked workers to total workers. Below 1.0, the system self-heals. At 1.0, every async task is starved.
 
