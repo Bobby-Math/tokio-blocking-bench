@@ -272,9 +272,9 @@ The difference is that `unsafe` requires an explicit keyword. Blocking requires 
 
 ## Conclusion
 
-The Tokio multi-threaded runtime is a cooperative system. Blocking code violates this contract silently. The runtime has no mechanism to detect the violation, because a `poll` call that takes 200 milliseconds is indistinguishable from one that takes 2 microseconds: both are function calls that have not yet returned.
+The Tokio multi-threaded runtime is a cooperative system, and blocking code violates that contract silently. When it does, the failure surfaces far from the cause and often looks like a problem in unrelated async code.
 
-Spare worker capacity absorbs the damage. Work-stealing redistributes tasks from blocked workers to free ones. As long as one worker remains free, the system self-heals. When the last free worker is lost, the self-healing mechanism collapses and scheduling delay jumps by two orders of magnitude.
+Spare workers absorb the initial damage through work-stealing, but only until the runtime reaches the saturation point. As long as one worker remains free, the system self-heals. When the last free worker is lost, the self-healing mechanism collapses and scheduling delay jumps by two orders of magnitude.
 
 Detection requires runtime introspection: `tokio-console` for development, `tokio::runtime::metrics` for production monitoring. Prevention requires discipline: replace blocking calls with async equivalents where they exist, isolate the rest behind `spawn_blocking`.
 
