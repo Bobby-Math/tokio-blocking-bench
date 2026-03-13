@@ -93,7 +93,7 @@ That creates a false sense of safety: if the code compiles, it feels safe, even 
 
 ### How blocking code enters async codebases
 
-Given that the compiler cannot help, blocking code enters production through several well-worn paths:
+Blocking code slips into async codebases surprisingly easily, usually through several well-worn paths:
 
 - Pre-async code: Utility functions that load config, parse static data, or read feature flags remain synchronous after a migration to async. They work correctly and are never rewritten.
 - The standard library: std::fs, std::net, and std::thread are synchronous. A developer who reaches for these out of habit writes code that compiles without warning. Tokio provides async equivalents, but the compiler does not suggest them.
@@ -229,7 +229,7 @@ for item in work_items {
 
 Prevention requires knowing where blocking code exists, but some blocking calls are buried in dependencies or are intermittent (a file read that only blocks when the page is not cached). For these cases, runtime detection is necessary. Standard tools are useless. What finally reveals the answer is runtime introspection into the executor itself.
 
-[tokio-console](https://github.com/tokio-rs/console) reveals executor starvation, but indirectly. Consider these two runs with identical parameters except for one additional blocking task:
+<a href="https://tokio-console.netlify.app/console_subscriber/" target="_blank" rel="noopener noreferrer">tokio-console</a> reveals executor starvation, but indirectly. Consider these two runs with identical parameters except for one additional blocking task:
 
 **3 blockers (one free worker remains):**
 
@@ -256,7 +256,7 @@ The cliff is visible in the numbers. Here are the top 5 async tasks from each ru
 
 The transition from 3 to 4 blockers represents the saturation point. With one free worker, the system limps along. Tasks wait 2-3 seconds but eventually complete. With zero free workers, the system enters lockdown. Tasks wait 6-7 seconds for 10ms of work. The Sched:Busy ratio jumps from ~350:1 to ~650:1. This is a threshold effect, not a linear increase.
 
-The same starvation pattern appears in worker-level metrics, where Tokio's [`tokio::runtime::RuntimeMetrics`] exposes signals such as high busy duration and low poll count. In production, divergence between workers is a strong indicator of blocking.
+The same starvation pattern appears in worker-level metrics, where Tokio's `tokio::runtime::RuntimeMetrics` exposes signals such as high busy duration and low poll count. In production, divergence between workers is a strong indicator of blocking.
 
 You can surface this failure mode earlier by testing with a deliberately small worker pool and driving concurrency against isolated async paths. That does not prove the absence of blocking, but it makes hidden starvation visible much earlier than production load does.
 
@@ -264,9 +264,7 @@ You can surface this failure mode earlier by testing with a deliberately small w
 
 If I could boil everything I learned down to one rule of thumb, it's this: if a function touches the network, reads from or writes to disk, calls into a C library through FFI, or runs CPU-intensive computation for more than a few hundred microseconds, it does not belong inside an async task without either an async equivalent or `spawn_blocking`.
 
-Treat this rule with the same discipline applied to `unsafe` code. We do not usually treat `async fn` with that level of respect, but code running on Tokio's worker pool depends on execution invariants the compiler does not enforce. `unsafe` tells the compiler: "I am taking responsibility for a safety invariant you cannot verify." A blocking call inside an async task is the scheduling equivalent: "I am taking responsibility for the cooperative contract the runtime cannot enforce." 
-
-The difference is that `unsafe` requires an explicit keyword. Blocking requires nothing. The compiler will not catch it. The tests will not catch it (unless they run at production-level concurrency). The staging environment will not catch it (unless it matches production load patterns). Only a deep understanding of Tokio's execution model will catch it.
+Treat this rule with discipline Rust asks of `unsafe` code. `unsafe` makes you responsible for invariants the compiler cannot verify; blocking work inside an async task does the same for the executor's cooperative scheduling contract.
 
 ---
 
