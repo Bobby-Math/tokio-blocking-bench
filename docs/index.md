@@ -12,7 +12,7 @@ My async Rust library was designed to manage concurrent event streams for a high
 
 The failure was catastrophic and silent. There were no stack traces and no error messages. This was Rust, a language I associated with explicit failures and strong diagnostics, failing with zero guidance. I questioned my async logic, but the integration points were identical to other working services.
 
-I felt betrayed by the safety guarantees I was accustomed to. Rust catches data races and use-after-free, but it remains indifferent to the silent sabotage of executor starvation.
+I felt betrayed by the guarantees I was accustomed to. Rust had trained me to expect that catastrophic failures would come from something obviously wrong. Instead, the cause turned out to be code that was completely valid, completely familiar, and disastrously misplaced.
 
 The answer was not in my new code but in a legacy blocking call buried in the main codebase. This synchronous bottleneck had existed for months without issue because previous workloads never pushed the runtime hard enough. My library, with its heavy concurrent processing, finally pushed the worker pool to its saturation point.
 
@@ -27,9 +27,7 @@ lightweight tasks.
 
 In a healthy system, tasks act as good citizens. A task borrows a worker thread for a few microseconds to execute logic until it hits an `.await` point. At this yield point, the task suspends its state and the worker thread is liberated to poll other tasks, check for I/O readiness, or perform work-stealing from other queues. This massive multiplexing ratio is the source of Rust's high-performance concurrency, but it introduces a single, catastrophic point of failure: the contract of cooperation.
 
-The runtime relies on the immutable assumption that tasks will yield frequently. If a task refuses to yield by executing synchronous blocking code, it does not merely slow down the system. It holds the worker thread hostage and prevents the entire runtime from progressing. 
-
-When you block a worker thread, you hold that worker hostage and paralyze the engine that powers every concurrent operation in the pipeline.
+The runtime relies on the immutable assumption that tasks will yield frequently. If a task refuses to yield by executing synchronous blocking code, it does not merely slow down the system; it holds a worker thread hostage and paralyzes the engine that powers every concurrent operation in the runtime.
 
 ### From my specific case to the general problem
 
@@ -99,6 +97,8 @@ A file read might return in 50 microseconds if the page is cached, or 5 millisec
 
 The compiler cannot distinguish this from legitimate CPU work that happens to take a long time. Static analysis cannot determine, in the general case, whether a function call will block. Blocking is a runtime property that depends on the kernel, the device, the network, and the current system load.
 
+That creates a false sense of safety: if the code compiles, it feels safe, even when the executor semantics say otherwise.
+
 ### How blocking code enters async codebases
 
 Given that the compiler cannot help, blocking code enters production through several well-worn paths:
@@ -120,6 +120,8 @@ At low concurrency, blocking calls rarely overlap. If one worker is blocked, the
 The self-healing breaks when blocking calls overlap enough to saturate the worker pool. When the number of blocked workers equals the total worker count, there are zero free workers running the poll loop. No tasks are polled. No I/O events are checked. No work-stealing happens.
 
 This is a cliff, not gradual degradation. [The demonstration](#the-demonstration) showed this empirically: zero failures at 15 concurrent requests, 94% at 50. The threshold is determined by the ratio of blocked workers to total workers. Below 1.0, the system self-heals. At 1.0, every async task is starved.
+
+This is also why executor starvation can turn into an "it works on my machine" bug. Tokio's multi-thread scheduler defaults to one worker thread per available CPU, so the same code can run with different worker counts on different machines and hit saturation at very different loads. More CPUs do not remove the cliff; they push it to a higher concurrency level, which is why the bug may reproduce on a smaller development machine, stay latent on a larger one, and then reappear under production load.
 
 ---
 
@@ -175,7 +177,7 @@ The first step is knowing what constitutes blocking in an async context. The def
 
 **FFI calls:** Any function call across the FFI boundary into a C library that performs I/O, computation, or synchronization internally. The Rust compiler has no visibility into what a C function does, and the function will not return `Poll::Pending` because it does not know it is running inside an async context.
 
-The common factor across all four categories is that the worker's poll loop cannot advance until the call returns.
+Across all four categories, the common factor is that the worker's poll loop cannot advance until the call returns. With an async equivalent, that changes: the worker thread is no longer held hostage during the wait.
 
 ### Replacing blocking calls with async equivalents
 
@@ -259,7 +261,7 @@ The same starvation pattern appears in worker-level metrics, where Tokio's [`tok
 
 If I could boil everything I learned down to one rule of thumb, it's this: if a function touches the network, reads from or writes to disk, calls into a C library through FFI, or runs CPU-intensive computation for more than a few hundred microseconds, it does not belong inside an async task without either an async equivalent or `spawn_blocking`.
 
-Treat this rule with the same discipline applied to `unsafe` code. `unsafe` tells the compiler: "I am taking responsibility for a safety invariant you cannot verify." A blocking call inside an async task is the scheduling equivalent: "I am taking responsibility for the cooperative contract the runtime cannot enforce." The difference is that `unsafe` requires an explicit keyword. Blocking requires nothing. The compiler will not catch it. The tests will not catch it (unless they run at production-level concurrency). The staging environment will not catch it (unless it matches production load patterns). Only understanding the runtime beneath your code will catch it.
+Treat this rule with the same discipline applied to `unsafe` code. We do not usually treat `async fn` with that level of respect, but code running on Tokio's worker pool depends on execution invariants the compiler does not enforce. `unsafe` tells the compiler: "I am taking responsibility for a safety invariant you cannot verify." A blocking call inside an async task is the scheduling equivalent: "I am taking responsibility for the cooperative contract the runtime cannot enforce." The difference is that `unsafe` requires an explicit keyword. Blocking requires nothing. The compiler will not catch it. The tests will not catch it (unless they run at production-level concurrency). The staging environment will not catch it (unless it matches production load patterns). Only a deep understanding of Tokio's execution model will catch it.
 
 ---
 
