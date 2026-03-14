@@ -1,175 +1,232 @@
 # tokio-blocking-bench
 
-**Reproduction benchmark: Blocking in async Rust is invisible at low load, catastrophic at high load.**
+Benchmarks, graphs, and analysis for one narrow question:
 
-## Thesis
+How do async Rust systems fail when memory safety is intact, but scheduling safety is not?
 
-When synchronous (blocking) code executes inside an async task on a Tokio multi-threaded runtime, it monopolizes one worker thread. The worker's polling loop cannot service any other task's Waker until the blocking call returns. At low concurrency, spare worker threads absorb the damage and latency remains normal. At high concurrency, blocked workers starve the runtime of polling capacity and async task latency degrades non-linearly, with a sharp cliff when blocked workers approach the total worker count.
+Rust gives strong guarantees about memory safety and race freedom. It does not guarantee forward progress, fair scheduling, or good lock lifetime discipline inside a Tokio runtime. This repository studies those failures directly.
 
-This is not a bug in Tokio. It is a deterministic consequence of a fixed-size cooperative thread pool encountering non-cooperative code.
+## Current Thesis
 
-## What this benchmark measures
+The repo now explores two scheduling-safety bug classes:
 
-**Metric: scheduling overhead.** Each async task calls `tokio::time::sleep(10ms)` and measures how long it actually sleeps. The overhead is `actual_duration - expected_duration`. In a healthy runtime, overhead is near zero (sub-millisecond). Under worker starvation, the timer fires on time (the kernel delivers the epoll event), but no worker thread is free to poll the woken task. The task sits in the ready queue until a worker becomes available. That queuing delay is the overhead we report.
+1. `Executor starvation`
+   Blocking work runs on Tokio worker threads, steals polling capacity, and produces a sharp latency and failure cliff when blocked workers approach total workers.
 
-**Why this metric is correct.** We isolate the runtime's ability to service a Waker promptly. We do not measure total task completion time (which conflates queuing delay with work duration) or wall-clock throughput (which hides per-request degradation behind averages).
+2. `Shared-state convoy`
+   Shared mutable state turns scheduler delay into reduced effective capacity. This appears in two subtypes:
+   - peer-task mutex convoy
+   - coordinator suspension convoy
 
-## Scenario matrix
+These are not memory-safety bugs. They are progress and capacity bugs.
 
-The benchmark runs 11 scenarios across two dimensions:
+## What Is In This Repo
 
-**Dimension 1: Async load.** 50 tasks ("low") vs 500 tasks ("high"). This represents the difference between a dev/staging environment and production traffic.
+### Article and graphs
 
-**Dimension 2: Blocking tasks.** 0 through 4, where 4 equals the worker thread count. Each blocking task calls `std::thread::sleep(50ms)` inside an async context, simulating a synchronous cloud download, DNS lookup, or file read.
+- Main article draft: [docs/index.md](docs/index.md)
+- Additional demo notes: [docs/ADDITIONAL_DEMOS.md](docs/ADDITIONAL_DEMOS.md)
+- Failure cliff graph: [docs/blocking_failure_cliff.png](docs/blocking_failure_cliff.png)
+- Scheduling cliff graph: [docs/benchmark_scheduling_cliff.png](docs/benchmark_scheduling_cliff.png)
+- Tokio console screenshots:
+  - [docs/task-starvation-3-blockers.png](docs/task-starvation-3-blockers.png)
+  - [docs/task-starvation-4-blockers.png](docs/task-starvation-4-blockers.png)
 
-```
-baseline/no-block          500 async,  0 blocking   (reference floor)
+### Benchmarks
 
-low-async/0-blockers        50 async,  0 blocking
-low-async/1-blocker         50 async,  1 blocking
-low-async/2-blockers        50 async,  2 blocking
-low-async/3-blockers        50 async,  3 blocking
-low-async/4-blockers        50 async,  4 blocking
+- [src/main.rs](src/main.rs)
+  - primary histogram benchmark for granular scheduling-delay degradation
+  - measures p50/p95/p99/max overhead on repeated `tokio::time::sleep(10ms)`
+  - this is the main benchmark used for local and EC2 scheduling-cliff analysis
 
-high-async/0-blockers      500 async,  0 blocking
-high-async/1-blocker       500 async,  1 blocking
-high-async/2-blockers      500 async,  2 blocking
-high-async/3-blockers      500 async,  3 blocking
-high-async/4-blockers      500 async,  4 blocking
-```
+- [src/bin/demo_panic.rs](src/bin/demo_panic.rs)
+  - operational failure demo
+  - shows the cliff through timeouts and cascading failure
 
-**Deliberately omitted:** Scenarios with blockers > workers. The interaction between queued blocking tasks introduces confounding scheduling dynamics (blocking tasks competing for workers among themselves) that obscure the core finding. The 0-to-N progression tells the story cleanly.
+- [src/bin/demo_per_request.rs](src/bin/demo_per_request.rs)
+  - measures scheduling delay directly as overhead on repeated `tokio::time::sleep(10ms)`
 
-## Assumptions
+- [src/bin/demo_load_ramp.rs](src/bin/demo_load_ramp.rs)
+  - shows that keeping one worker free is not the same as being safe under arbitrary load
 
-1. **Fixed worker count.** Default: 4 workers. This simulates a typical production container (4 vCPUs). The critical variable is `blocking_tasks / worker_threads`. All claims are relative to this ratio.
+- [src/bin/demo_mutex_convoy.rs](src/bin/demo_mutex_convoy.rs)
+  - models peer-task shared-state contention
+  - shows how holding a `tokio::sync::Mutex` across `.await` lowers effective capacity
 
-2. **`std::thread::sleep` as the blocking proxy.** Real-world blocking sources include: synchronous HTTP clients (`reqwest::blocking`), synchronous DNS resolution, file I/O through `std::fs`, CPU-heavy parsing without yield points, and FFI calls into blocking C libraries. `std::thread::sleep` is chosen because it blocks for a deterministic, known duration with no side effects, isolating the scheduling impact.
+- [src/bin/demo_suspension_convoy.rs](src/bin/demo_suspension_convoy.rs)
+  - models a coordinator task that suspends while still holding shared state
+  - compares `good` vs `bad` lock lifetime under otherwise identical conditions
 
-3. **`tokio::time::sleep` as the async I/O proxy.** This exercises the same Waker machinery as TCP reads, HTTP requests, or database queries: the timer wheel fires, calls `waker.wake()`, and the task is re-enqueued for polling. The scheduling overhead measured here applies equally to all Waker-driven async operations.
+### Design notes
 
-4. **No cross-task data dependencies.** Tasks are independent. This isolates the scheduling effect from contention on shared state. In production, mutex/channel contention would compound the problem.
+- [mutex_contention.md](mutex_contention.md)
+  - benchmark note for peer-task mutex convoying
 
-5. **Barrier-synchronized start.** All tasks begin simultaneously to measure steady-state concurrent behavior, not sequential ramp-up.
+- [suspension_convoy.md](suspension_convoy.md)
+  - benchmark note for coordinator suspension convoying
 
-6. **Fresh runtime per scenario.** Each scenario constructs and drops its own Tokio runtime to prevent carryover effects.
+## Conceptual Map
 
-## Data collection protocol
+### 1. Executor starvation
 
-For publishable results, run the full matrix 3 times and report median values.
+This is the Part 1 problem.
+
+Blocking code inside async tasks violates Tokio's cooperative model:
+
+- workers are fixed
+- tasks must yield
+- blocking code does not yield
+- spare workers can absorb initial damage
+- once the pool saturates, async latency explodes
+
+Primary artifact:
+- scheduling delay
+
+Primary demos:
+- `demo_panic`
+- `demo_per_request`
+- `demo_load_ramp`
+
+### 2. Shared-state convoy
+
+This is the Part 2 direction.
+
+The system can still collapse even when it is not simply "out of threads". Shared mutable state changes the structure of progress:
+
+- tasks are no longer independent
+- progress depends on resource release
+- scheduler delay becomes lock hold time
+- effective capacity drops before the runtime looks obviously dead
+
+Two variants are now modeled:
+
+- `demo_mutex_convoy`
+  - many peer tasks queue behind a shared mutex
+
+- `demo_suspension_convoy`
+  - one coordinator task suspends while still holding shared state
+
+## Why `demo_suspension_convoy` Matters
+
+This benchmark isolates a different failure shape than raw worker starvation.
+
+It keeps the coordinator, shared state, event channel, and consumer constant. The only intentional difference is whether the coordinator performs `send().await` before or after releasing the shared-state lock.
+
+That makes the proof signal clean:
+
+- `good`: coordinator lock-hold p95 stays around `1us`
+- `bad`: coordinator lock-hold p95 grows to roughly `6400us`
+
+The main signal is lock hold time, not just late-event percentage.
+
+## Recommended Reading Order
+
+1. [docs/index.md](docs/index.md)
+2. [src/main.rs](src/main.rs)
+3. [src/bin/demo_panic.rs](src/bin/demo_panic.rs)
+4. [src/bin/demo_per_request.rs](src/bin/demo_per_request.rs)
+5. [src/bin/demo_mutex_convoy.rs](src/bin/demo_mutex_convoy.rs)
+6. [src/bin/demo_suspension_convoy.rs](src/bin/demo_suspension_convoy.rs)
+7. [mutex_contention.md](mutex_contention.md)
+8. [suspension_convoy.md](suspension_convoy.md)
+
+## Build
 
 ```bash
-# Build
 cargo build --release
-
-# 3 runs, output captured to file
-./target/release/tokio-blocking-bench --run-all --runs 3 > results_local.txt 2>&1
-
-# Or on EC2
-./target/release/tokio-blocking-bench --run-all --runs 3 > results_ec2.txt 2>&1
 ```
 
-When reporting data in the article:
-- State the exact command, instance type, and OS.
-- State the number of runs.
-- Report median values across runs for each scenario.
-- If reporting a single run, state that explicitly.
-- Never mix values from different runs in the same table.
-- Compare against baseline from the SAME run, not across runs.
+## Benchmark Usage
 
-## Expected results (based on preliminary data)
+### Part 1: executor starvation
 
-| Blocking ratio | Low async (50 tasks) | High async (500 tasks) |
-|---|---|---|
-| 0/4 workers | p99 < 2ms overhead | p99 < 2ms overhead |
-| 1/4 workers | p99 < 2ms | p99 < 2ms |
-| 2/4 workers | p99 < 2ms | p99 2-3ms (mild degradation) |
-| 3/4 workers | p99 < 3ms | p99 < 3ms |
-| **4/4 workers** | **p99 increases** | **p99 100-200ms (cliff)** |
-
-The cliff at 4/4 is the central finding. The contrast between low-async/4-blockers and high-async/4-blockers demonstrates that the same blocking code produces different outcomes depending on async load, which is the "invisible until production" thesis.
-
-## Defensible claims (from preliminary data)
-
-These three claims held up across both local (Pop!_OS desktop) and EC2 (c6i.xlarge) runs:
-
-1. **The cliff is real.** Going from 3/4 blocked to 4/4 blocked causes a 100x+ p99 increase under high async load.
-
-2. **p50 is blind.** Median scheduling overhead remains stable even at full blockage. Monitoring based on p50 or mean will not detect this failure until it cascades into timeouts or panics.
-
-3. **One free worker is sufficient.** A single unblocked worker can keep 500 async tasks at sub-2ms p99. Zero free workers means 190ms+ p99. The system is binary: it works or it doesn't.
-
-## Claims to verify with clean data
-
-- Whether low-async/4-blockers also shows the cliff (expected: yes, but less dramatic due to fewer tasks competing for the one worker during yield gaps).
-- Whether p50 truly does not move or moves slightly (~16% increase was observed on desktop but not EC2). Conservative framing: "p50 degradation is minimal relative to the p99 explosion."
-- The exact multiplier (100x vs 136x depends on whether you compare to the 3-blocker scenario or the 0-blocker baseline; state which reference is used).
-
-## Usage
-
-### Run full scenario matrix with 3 repetitions
+Run the primary granular scheduling benchmark:
 
 ```bash
-cargo build --release
 ./target/release/tokio-blocking-bench --run-all --runs 3
 ```
 
-### Run a single custom scenario
+Run the operational failure demo:
 
 ```bash
-./target/release/tokio-blocking-bench \
-    --workers 4 \
-    --async-tasks 500 \
-    --blocking-tasks 3
+./target/release/demo_panic --run-all
 ```
 
-### Vary worker count (multi-instance comparison)
+Run the direct scheduling-delay benchmark:
 
 ```bash
-# 2-core (t3.small / c6i.medium)
-./target/release/tokio-blocking-bench --run-all --runs 3 --workers 2
-
-# 4-core (c6i.xlarge)
-./target/release/tokio-blocking-bench --run-all --runs 3 --workers 4
-
-# 8-core (c6i.2xlarge)
-./target/release/tokio-blocking-bench --run-all --runs 3 --workers 8
+./target/release/demo_per_request --run-all
 ```
 
-## CLI reference
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--workers` | 4 | Tokio worker thread count (0 = num_cpus) |
-| `--async-tasks` | 200 | Number of async I/O simulation tasks |
-| `--blocking-tasks` | 0 | Number of blocking tasks |
-| `--async-sleep-ms` | 10 | Duration of each async sleep (ms) |
-| `--blocking-sleep-ms` | 50 | Duration of each blocking call (ms) |
-| `--iterations` | 10 | Sleep iterations per async task |
-| `--blocking-iterations` | 5 | Blocking iterations per blocking task |
-| `--run-all` | false | Run predefined scenario matrix |
-| `--runs` | 1 | Number of full repetitions (for `--run-all`) |
-
-## EC2 setup
-
-| Instance | vCPUs | Cost/hr | Notes |
-|----------|-------|---------|-------|
-| c6i.large | 2 | ~$0.085 | Cliff appears earliest (fewer workers) |
-| c6i.xlarge | 4 | ~$0.17 | Matches default config, primary data source |
-| c6i.2xlarge | 8 | ~$0.34 | Shows how more workers delay the cliff |
+Run the load-ramp comparison:
 
 ```bash
-# Amazon Linux 2023
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-source ~/.cargo/env
-# scp or git clone the project
-cargo build --release
-./target/release/tokio-blocking-bench --run-all --runs 3 > results.txt
-cat results.txt
-# terminate instance
+./target/release/demo_load_ramp --run-all
 ```
 
-Total cost for 3 instance sizes, 3 runs each: < $2.
+### Part 2: shared-state convoy
+
+Run the mutex convoy benchmark:
+
+```bash
+./target/release/demo_mutex_convoy --run-all
+```
+
+Run the suspension convoy benchmark:
+
+```bash
+./target/release/demo_suspension_convoy --run-all
+```
+
+For full CLI details on any benchmark, run the binary with `--help`.
+
+## Interpreting Results
+
+### Executor starvation
+
+Primary signals:
+
+- failure cliff
+- timeout rate
+- scheduling overhead
+
+Secondary signals:
+
+- p50 stability
+- total wall-clock duration
+
+### Shared-state convoy
+
+Primary signals:
+
+- lock hold time
+- lock acquisition delay
+
+Secondary signals:
+
+- event lateness
+- end-to-end event latency
+
+The important distinction is that event-level latency depends on thresholds and workload shape. Lock lifetime is the direct mechanism.
+
+## Repo Status
+
+This repository is no longer just a single blocking benchmark.
+
+It now contains:
+
+- the article draft
+- graph assets
+- the original starvation demos
+- a peer-task mutex convoy benchmark
+- a coordinator suspension convoy benchmark
+- written design notes for both shared-state convoy benchmarks
+
+The current research direction is:
+
+- Rust enforces memory safety
+- Tokio provides an efficient cooperative runtime
+- scheduling safety remains the engineer's responsibility
 
 ## License
 
