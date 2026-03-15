@@ -21,7 +21,7 @@ This article explores the diagnostic vacuum I faced and the three-line architect
 ### Understanding the crash
 
 To diagnose why my library triggered a collapse while others remained stable, we must examine the relationship between hardware, OS threads,
-and the Tokio runtime. Tokio operates on an M:N threading model, essentially a form of green threading, where many tasks are multiplexed onto a small number of worker threads. On a 4-vCPU machine, Tokio typically spawns four worker threads, each running a cooperative poll loop designed to cycle through thousands of lightweight tasks.
+and the Tokio runtime. Tokio operates on an M:N threading model, essentially a form of green threading, where many tasks are multiplexed onto a small number of worker threads. On a 4-vCPU machine, Tokio typically spawns four worker threads, each with its own local run queue and poll loop, designed to cycle through thousands of lightweight tasks.
 
 In a healthy system, tasks act as good citizens. A task borrows a worker thread for a few microseconds to execute logic until it hits an `.await` point. At this yield point, the task suspends its state and the worker thread is liberated to poll other tasks, check for I/O readiness, or perform work-stealing from other queues. This massive multiplexing ratio is the source of Rust's high-performance concurrency, but it introduces a single, catastrophic point of failure: the contract of cooperation.
 
