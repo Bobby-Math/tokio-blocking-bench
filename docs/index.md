@@ -87,6 +87,14 @@ The function signature says `async fn`, so the compiler generates a state machin
 
 A file read might return in 50 microseconds if the page is cached, or 5 milliseconds if it hits disk, or 500 milliseconds if the NFS server is slow. The compiler sees a function call that returns `Result<Vec<u8>, io::Error>` and has no way to know which of those scenarios will occur.
 
+```rust
+async fn verify_payload(input: &[u8]) -> bool {
+    unsafe { ffi_crypto_lib::verify(input.as_ptr(), input.len()) }
+}
+```
+
+This crosses the FFI boundary into foreign code that may block or burn CPU for the entire call. Tokio cannot preempt it, and the compiler has no basis to warn.
+
 The compiler cannot distinguish this from legitimate CPU work that happens to take a long time. Static analysis cannot determine, in the general case, whether a function call will block. Blocking is a runtime property that depends on the kernel, the device, the network, and the current system load.
 
 That creates a false sense of safety: if the code compiles, it feels safe, even when the executor semantics say otherwise.
@@ -188,6 +196,8 @@ let config = tokio::fs::read("/etc/app/config.toml").await?;
 The same pattern applies to HTTP (reqwest::blocking::get → reqwest::get), sleep (std::thread::sleep → tokio::time::sleep), DNS (std::net::ToSocketAddrs → tokio::net::lookup_host), and any other I/O operation.
 
 In every case, the network latency or disk latency is identical. The CPU work is identical. What changes is that the worker thread is no longer held hostage during the wait. The state machine yields at the `.await` point, the worker polls other tasks, and the task resumes when the I/O completes.
+
+Some Tokio async replacements are still built on offloaded blocking work, especially filesystem APIs such as `tokio::fs::read`, `tokio::fs::write`, `tokio::fs::metadata`, and `tokio::fs::File::open`. Others, such as `tokio::net::TcpStream`, `tokio::net::TcpListener`, and `tokio::net::UdpSocket`, use true non-blocking async I/O.
 
 ### Using spawn_blocking when async equivalents do not exist
 
