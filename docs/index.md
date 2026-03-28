@@ -106,7 +106,7 @@ Blocking code slips into async codebases surprisingly easily, usually through se
 - Pre-async code: Utility functions that load config, parse static data, or read feature flags remain synchronous after a migration to async. They work correctly and are never rewritten.
 - The standard library: std::fs, std::net, and std::thread are synchronous. A developer who reaches for these out of habit writes code that compiles without warning. Tokio provides async equivalents, but the compiler does not suggest them.
 - Non-obvious blocking: println! to a slow stdout, serde_json::from_slice on large payloads, env::var under contention. These do not look like blocking I/O in code review.
-- FFI calls: Any call into a C library is blocking by default. Crypto libraries, compression, DNS resolution via libc; these all block the calling thread.
+- FFI calls: Any call across the FFI boundary is opaque to Rust's async runtime. A C function may block, burn CPU, or perform internal synchronization without yielding, and neither the compiler nor Tokio can reason about that behavior.
 - Transitive dependencies: A crate three layers deep calls std::fs::metadata or reqwest::blocking::get. You never see it in your source code. It compiles, passes CI, and blocks in production.
 
 Across all paths, the blocking code is correct. It produces the right output. The defect is not in what the code does, but in where it runs.
@@ -121,7 +121,7 @@ The self-healing breaks when blocking calls overlap enough to saturate the worke
 
 Even before total saturation, blocking steals polling capacity from the executor, so the runtime can no longer translate available hardware into the async throughput and latency that machine should be able to deliver.
 
-This is a cliff, not gradual degradation. [The demonstration](#the-demonstration) showed this empirically: zero failures at 15 concurrent requests, 94% at 50. The threshold is determined by the ratio of blocked workers to total workers. Below 1.0, the system self-heals. At 1.0, every async task is starved.
+This is a cliff, not a smooth degradation curve. [The demonstration](#the-demonstration) showed this empirically: zero failures at 15 concurrent requests, 94% at 50. Harmful tail-latency inflation begins before full saturation, but the sharp collapse appears when blocked workers approach the total worker count. At that point, the runtime loses most or all of its polling capacity, and starvation becomes visible as a system-wide failure rather than a localized slowdown.
 
 This is also why executor starvation can turn into an "it works on my machine" bug. Tokio's multi-thread scheduler defaults to one worker thread per available CPU, so the same code can run with different worker counts on different machines and hit saturation at very different loads. More CPUs do not remove the cliff; they push it to a higher concurrency level, which is why the bug may reproduce on a smaller development machine, stay latent on a larger one, and then reappear under production load.
 
@@ -151,7 +151,7 @@ Blocking code inflates scheduling overhead from microseconds to hundreds of mill
 query time leaves 90ms for scheduling jitter. Under starvation, the task waits 140ms in the ready queue before being polled. The query still
 takes 10ms, but the total is 150ms and the timeout fires.
 
-**Channel backpressure:** Bounded channels (`tokio::sync::mpsc`) fill when the consumer task is stalled. The producer's `send()` calls block or timeout with errors like "channel full." The error points at the producer-consumer boundary, not at the blocking code that stalled the consumer.
+**Channel backpressure:** Bounded channels (`tokio::sync::mpsc`) fill when the consumer task is stalled. The producer's `send().await` calls stop making progress and may eventually hit a higher-level timeout or failure path. The error points at the producer-consumer boundary, not at the blocking code that stalled the consumer.
 
 **Connection pool exhaustion:** Database pools are exhausted when stalled tasks hold connections while waiting to be polled. The pool reports "acquire timeout" even though the database is healthy and underloaded. Connections are occupied by tasks that cannot execute, not by active queries.
 
@@ -177,7 +177,7 @@ The first step is knowing what constitutes blocking in an async context. The def
 
 **CPU-bound computation that exceeds the cooperative threshold:** `serde_json::from_slice` on a multi-megabyte payload, image encoding, cryptographic operations, compression. These do not enter the kernel, but they hold the worker for the duration of the computation without yielding.
 
-**FFI calls:** Any function call across the FFI boundary into a C library that performs I/O, computation, or synchronization internally. The Rust compiler has no visibility into what a C function does, and the function will not return `Poll::Pending` because it does not know it is running inside an async context.
+**FFI calls:** Any function call across the FFI boundary into a C library is opaque to the Rust compiler and to Tokio. If that foreign function performs I/O, heavy computation, or internal synchronization, it can hold the calling thread without yielding, and the async runtime has no visibility into that behavior.
 
 Across all four categories, the common factor is that the worker's poll loop cannot advance until the call returns. With an async equivalent, that changes: the worker thread is no longer held hostage during the wait.
 
@@ -237,7 +237,7 @@ for item in work_items {
 
 ### Detecting blocking at runtime
 
-Prevention requires knowing where blocking code exists, but some blocking calls are buried in dependencies or are intermittent (a file read that only blocks when the page is not cached). For these cases, runtime detection is necessary. Standard tools are useless. What finally reveals the answer is runtime introspection into the executor itself.
+Prevention requires knowing where blocking code exists, but some blocking calls are buried in dependencies or are intermittent (a file read that only blocks when the page is not cached). For these cases, runtime detection is necessary. Standard logs and application-level traces are usually not enough. What finally reveals the answer is runtime introspection into the executor itself.
 
 <a href="https://tokio-console.netlify.app/console_subscriber/" target="_blank" rel="noopener noreferrer">tokio-console</a> reveals executor starvation, but indirectly. Consider these two runs with identical parameters except for one additional blocking task:
 
@@ -264,7 +264,7 @@ The cliff is visible in the numbers. Here are the top 5 async tasks from each ru
 | **4 blockers** | 12 | **6.8s** | 11ms | 677 | **618:1** |
 | **4 blockers** | 13 | **6.6s** | 10ms | 653 | **660:1** |
 
-The transition from 3 to 4 blockers represents the saturation point. With one free worker, the system limps along. Tasks wait 2-3 seconds but eventually complete. With zero free workers, the system enters lockdown. Tasks wait 6-7 seconds for 10ms of work. The Sched:Busy ratio jumps from ~350:1 to ~650:1. This is a threshold effect, not a linear increase.
+The transition from 3 to 4 blockers represents the saturation edge in this benchmark. With one free worker, the system limps along. With four blocking tasks on four workers, the runtime spends much of its time starved of polling capacity, with only brief recovery windows between blocking phases. Tasks still do almost no useful work relative to their wait time, and the Sched:Busy ratio jumps from ~350:1 to ~650:1. This is a threshold effect, not a linear increase.
 
 The same starvation pattern appears in worker-level metrics, where Tokio's `tokio::runtime::RuntimeMetrics` exposes signals such as high busy duration and low poll count. In production, divergence between workers is a strong indicator of blocking.
 
@@ -272,7 +272,7 @@ You can surface this failure mode earlier by testing with a deliberately small w
 
 ### The engineering rule
 
-If I could boil everything I learned down to one rule of thumb, it's this: if a function touches the network, reads from or writes to disk, calls into a C library through FFI, or runs CPU-intensive computation for more than a few hundred microseconds, it does not belong inside an async task without either an async equivalent or `spawn_blocking`.
+If I could boil everything I learned down to one rule of thumb, it's this: if a function touches the network, reads from or writes to disk, calls into foreign code, or performs enough CPU work that it meaningfully delays other tasks, it does not belong on a Tokio worker thread without either an async equivalent or `spawn_blocking`.
 
 Treat this rule with discipline Rust asks of `unsafe` code. `unsafe` makes you responsible for invariants the compiler cannot verify; blocking work inside an async task does the same for the executor's cooperative scheduling contract.
 
